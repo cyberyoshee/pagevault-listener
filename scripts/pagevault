@@ -1,0 +1,69 @@
+#!/bin/bash
+# PageVault daemon control
+# Usage: pagevault start|stop|restart|status
+
+SCRIPTS="$HOME/pagevault/scripts"
+STATE="$HOME/pagevault/state"
+DAEMON=$(ls "$SCRIPTS"/pagevault_daemon_v*.py 2>/dev/null | sort -V | tail -1)
+
+case "${1:-}" in
+    start)
+        if pgrep -f pagevault_daemon > /dev/null; then
+            echo "Daemon already running (PID: $(pgrep -f pagevault_daemon | head -1))"
+            exit 1
+        fi
+        if [ -z "$DAEMON" ]; then
+            echo "No daemon script found in $SCRIPTS"
+            exit 1
+        fi
+        nohup python3 "$DAEMON" >> "$STATE/daemon.log" 2>&1 &
+        sleep 3
+        if pgrep -f pagevault_daemon > /dev/null; then
+            echo "Started (PID: $(pgrep -f pagevault_daemon | head -1))"
+        else
+            echo "Failed to start. Check $STATE/daemon.log"
+            exit 1
+        fi
+        ;;
+    stop)
+        pkill -f pagevault_daemon 2>/dev/null
+        pkill -f rtl_airband 2>/dev/null
+        pkill -f "parec.*pv_" 2>/dev/null
+        pkill -f multimon-ng 2>/dev/null
+        sleep 2
+        echo "Stopped"
+        ;;
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+    status)
+        if [ -f "$SCRIPTS/status.sh" ]; then
+            "$SCRIPTS/status.sh"
+        elif [ -f "$STATE/status.txt" ]; then
+            cat "$STATE/status.txt"
+        else
+            echo "No status available"
+        fi
+        ;;
+    update)
+        if [ -f "$SCRIPTS/update.sh" ]; then
+            "$SCRIPTS/update.sh"
+        elif [ -f "$SCRIPTS/setup.sh" ]; then
+            "$SCRIPTS/setup.sh" --update
+        else
+            echo "No update script found in $SCRIPTS"
+            exit 1
+        fi
+        # Restart daemon if it was running to pick up new code
+        if pgrep -f pagevault_daemon > /dev/null; then
+            echo "Restarting daemon to apply updates..."
+            $0 restart
+        fi
+        ;;
+    *)
+        echo "Usage: pagevault start|stop|restart|status|update"
+        exit 1
+        ;;
+esac

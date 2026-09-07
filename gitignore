@@ -1,0 +1,20 @@
+# Runtime data
+logs/
+state/
+config/
+iq/
+
+# Build artifacts
+*.pyc
+__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
