@@ -21,6 +21,7 @@ CLI:
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -31,6 +32,12 @@ MAX_SERIAL_LEN = 16
 
 # Channel names become PulseAudio sink names, and rtl_airband stream names
 SINK_PREFIX = "pv_"
+
+# Ids, serials and channel names all end up somewhere that rejects or mangles
+# punctuation: a PulseAudio sink name, a libconfig string in the generated
+# rtl_airband config, an EEPROM field, a shell variable in dongles.conf.
+# Enforce one conservative charset rather than debugging it at runtime.
+SAFE_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
 
 
 class CatalogueError(Exception):
@@ -80,6 +87,10 @@ def validate_catalogue(data):
         bid = block.get("id")
         if not bid:
             raise CatalogueError("Every block needs an 'id'")
+        if not SAFE_NAME.match(str(bid)):
+            raise CatalogueError(
+                f"Block id '{bid}': use only letters, digits, '-' and '_'"
+            )
         if bid in seen_ids:
             raise CatalogueError(f"Duplicate block id: {bid}")
         seen_ids.add(bid)
@@ -87,6 +98,11 @@ def validate_catalogue(data):
         serial = block.get("serial")
         if not serial:
             raise CatalogueError(f"Block '{bid}' has no 'serial'")
+        if not SAFE_NAME.match(serial):
+            raise CatalogueError(
+                f"Block '{bid}' serial '{serial}': use only letters, digits, "
+                "'-' and '_'"
+            )
         if len(serial) > MAX_SERIAL_LEN:
             raise CatalogueError(
                 f"Block '{bid}' serial '{serial}' is {len(serial)} chars, "
@@ -113,6 +129,12 @@ def validate_catalogue(data):
             freq = ch.get("freq_hz")
             if not name:
                 raise CatalogueError(f"Block '{bid}' has a channel with no name")
+            if not SAFE_NAME.match(str(name)):
+                raise CatalogueError(
+                    f"Block '{bid}': channel name '{name}' must use only "
+                    "letters, digits, '-' and '_' (it becomes the PulseAudio "
+                    f"sink '{SINK_PREFIX}{name}')"
+                )
             if not isinstance(freq, (int, float)) or freq <= 0:
                 raise CatalogueError(f"Channel '{name}' has no valid freq_hz")
             # Sink names are derived from channel names, so they must be
