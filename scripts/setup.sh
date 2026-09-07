@@ -17,7 +17,7 @@
 #   8. Creates listener config (interactive prompts)
 #   9. Self-registers with central server (registration token)
 #  10. Sets up cron jobs (status push, log transfer)
-#  11. Optionally starts daemon and enables auto-start on boot
+#  11. Optionally starts daemon and installs a systemd user unit
 #
 # Usage:
 #   ./setup.sh                     # Full setup
@@ -26,9 +26,9 @@
 #
 # Prerequisites:
 #   - Ubuntu 26.04 LTS (desktop with PipeWire/PulseAudio)
-#   - Internet access
-#   - sudo privileges
+#   - Internet access, sudo privileges, and a terminal (setup is interactive)
 #   - Registration token from the PageVault admin
+#   - Safe to run via `curl ... | bash`: prompts read from /dev/tty, not stdin
 #
 # ============================================================
 
@@ -43,7 +43,6 @@ trap 'log_error "Setup failed at line $LINENO. Check output above for details.";
 
 REPO_URL="https://github.com/cyberyoshee/pagevault.git"
 REPO_BRANCH="main"
-DAEMON_VERSION="v2_8"
 PAGEVAULT_HOME="$HOME/pagevault"
 PAGEVAULT_SCRIPTS="$PAGEVAULT_HOME/scripts"
 PAGEVAULT_CONFIG="$PAGEVAULT_HOME/config"
@@ -62,6 +61,72 @@ NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Prompts must read from the terminal, never stdin: when this script is
+# installed via `curl ... | bash`, stdin is the script text itself and a bare
+# `read` would silently consume the rest of the script as its answer.
+# Probe with a redirect on a simple command: /dev/tty can pass -c/-r yet still
+# fail to open with ENXIO when there is no controlling terminal, and a failed
+# redirect on `exec` terminates the shell outright.
+if (: < /dev/tty) 2>/dev/null; then
+    exec 3< /dev/tty
+    INTERACTIVE=true
+elif [ -t 0 ]; then
+    exec 3<&0
+    INTERACTIVE=true
+else
+    INTERACTIVE=false
+fi
+
+# prompt <varname> <prompt text>
+# Reads one line into <varname>. Leaves it empty when non-interactive.
+prompt() {
+    local __var="$1"
+    local __text="$2"
+    local __val=""
+
+    if [ "$INTERACTIVE" = true ]; then
+        # stdout is still the terminal even when stdin is a pipe
+        printf "%s" "$__text"
+        IFS= read -r __val <&3 || __val=""
+    fi
+
+    printf -v "$__var" '%s' "$__val"
+}
+
+require_interactive() {
+    if [ "$INTERACTIVE" != true ]; then
+        echo ""
+        log_error "$1 requires an interactive terminal, but none is available."
+        log_error "Re-run setup from a terminal:"
+        log_error "  git clone $REPO_URL && ./pagevault/scripts/setup.sh"
+        exit 1
+    fi
+}
+
+# Install scripts from a staging directory into PAGEVAULT_SCRIPTS.
+#
+# Uses rename(2) rather than copying in place. This script is one of the files
+# being replaced, and bash reads a script incrementally by byte offset -- an
+# in-place overwrite corrupts the still-executing setup.sh precisely when the
+# incoming version differs, which is exactly the update case. Replacing the
+# inode leaves our open file descriptor pointing at the original content.
+# The staging directory therefore has to live on the same filesystem.
+install_scripts() {
+    local staging="$1"
+    local f name
+
+    mkdir -p "$PAGEVAULT_SCRIPTS"
+
+    for f in "$staging"/*; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        case "$name" in
+            *.sh|*.py|pagevault) chmod +x "$f" ;;
+        esac
+        mv -f "$f" "$PAGEVAULT_SCRIPTS/$name"
+    done
+}
 
 check_ubuntu() {
     if ! grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
@@ -117,19 +182,33 @@ if [ "$UPDATE_ONLY" = true ]; then
         exit 1
     fi
 
-    TEMP_REPO="/tmp/pagevault-repo-$$"
-    git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TEMP_REPO" 2>/dev/null
+    # Stage inside PAGEVAULT_HOME so install_scripts can use a plain rename
+    mkdir -p "$PAGEVAULT_HOME"
+    TEMP_REPO="$PAGEVAULT_HOME/.update-$$"
+    trap 'rm -rf "$TEMP_REPO"' EXIT
+
+    if ! git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TEMP_REPO" 2>/dev/null; then
+        log_error "Could not clone $REPO_URL (branch $REPO_BRANCH)"
+        exit 1
+    fi
 
     if [ -d "$TEMP_REPO/scripts" ]; then
-        cp -r "$TEMP_REPO/scripts/"* "$PAGEVAULT_SCRIPTS/"
-        chmod +x "$PAGEVAULT_SCRIPTS/"*.py "$PAGEVAULT_SCRIPTS/"*.sh 2>/dev/null || true
-        [ -f "$PAGEVAULT_SCRIPTS/pagevault" ] && chmod +x "$PAGEVAULT_SCRIPTS/pagevault"
+        install_scripts "$TEMP_REPO/scripts"
         log_info "Scripts updated from repository"
     else
         log_warn "No scripts directory found in repository"
+        rm -rf "$TEMP_REPO"
+        exit 1
     fi
 
     rm -rf "$TEMP_REPO"
+
+    # Pick up the new code if the daemon is running
+    if pgrep -f pagevault_daemon > /dev/null; then
+        log_info "Restarting daemon to apply updates"
+        "$PAGEVAULT_SCRIPTS/pagevault" restart || log_warn "Daemon restart failed -- check 'pagevault status'"
+    fi
+
     echo ""
     log_info "Update complete"
     exit 0
@@ -143,7 +222,8 @@ log_info "Step 1/11: Installing system dependencies"
 
 sudo apt update -qq
 
-sudo apt install -y -qq \
+APT_LOG=$(mktemp)
+if ! sudo apt install -y -qq \
     rtl-sdr \
     multimon-ng \
     sox \
@@ -162,7 +242,24 @@ sudo apt install -y -qq \
     libfftw3-dev \
     librtlsdr-dev \
     libpulse-dev \
-    > /dev/null 2>&1
+    pulseaudio-utils \
+    > "$APT_LOG" 2>&1
+then
+    log_error "Package installation failed:"
+    tail -30 "$APT_LOG"
+    rm -f "$APT_LOG"
+    exit 1
+fi
+rm -f "$APT_LOG"
+
+# The daemon shells out to these directly -- fail loudly here rather than
+# leaving every decoder chain to crash at runtime.
+for bin in pactl parec sox multimon-ng rtl_test; do
+    if ! command -v "$bin" > /dev/null 2>&1; then
+        log_error "Required command '$bin' not found after package install"
+        exit 1
+    fi
+done
 
 log_info "System dependencies installed"
 
@@ -320,22 +417,22 @@ log_info "Directory structure created at $PAGEVAULT_HOME"
 
 log_info "Step 7/11: Pulling latest scripts"
 
-TEMP_REPO="/tmp/pagevault-repo-$$"
+TEMP_REPO="$PAGEVAULT_HOME/.update-$$"
+trap 'rm -rf "$TEMP_REPO"' EXIT
 
 if echo "$REPO_URL" | grep -q "CHANGEME"; then
     log_warn "Repository URL not configured in setup.sh"
     log_warn "Skipping script pull -- copy scripts manually to $PAGEVAULT_SCRIPTS/"
 else
-    git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TEMP_REPO" 2>/dev/null
-
-    if [ -d "$TEMP_REPO/scripts" ]; then
-        cp -r "$TEMP_REPO/scripts/"* "$PAGEVAULT_SCRIPTS/"
-        chmod +x "$PAGEVAULT_SCRIPTS/"*.py "$PAGEVAULT_SCRIPTS/"*.sh 2>/dev/null || true
-        # Also chmod scripts without extensions (e.g. the 'pagevault' control script)
-        [ -f "$PAGEVAULT_SCRIPTS/pagevault" ] && chmod +x "$PAGEVAULT_SCRIPTS/pagevault"
-        log_info "Scripts pulled from repository"
+    if git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TEMP_REPO" 2>/dev/null; then
+        if [ -d "$TEMP_REPO/scripts" ]; then
+            install_scripts "$TEMP_REPO/scripts"
+            log_info "Scripts pulled from repository"
+        else
+            log_warn "No scripts directory found in repository"
+        fi
     else
-        log_warn "No scripts directory found in repository"
+        log_warn "Could not clone $REPO_URL -- continuing with scripts already on disk"
     fi
 
     rm -rf "$TEMP_REPO"
@@ -357,7 +454,18 @@ LISTENER_CONF="$PAGEVAULT_CONFIG/listener.conf"
 
 if [ -f "$LISTENER_CONF" ]; then
     log_info "Listener config already exists, not overwriting"
+    # Holds the central API key -- tighten perms on configs from older setups
+    chmod 600 "$LISTENER_CONF"
+
+    # Migration: setups before v2.9 always wrote DONGLE2_ENABLED=false, and the
+    # daemon ignored the flag and drove both dongles anyway. Now that the flag
+    # is honoured, a stale 'false' would silently drop a working second dongle.
+    if [ "${DONGLE_COUNT:-0}" -ge 2 ] && grep -q '^DONGLE2_ENABLED=false' "$LISTENER_CONF"; then
+        sed -i 's|^DONGLE2_ENABLED=.*|DONGLE2_ENABLED=true|' "$LISTENER_CONF"
+        log_info "Second dongle detected -- enabled DONGLE2 in existing config"
+    fi
 else
+    require_interactive "Listener configuration"
     echo ""
     echo "============================================================"
     echo "  Listener Identification"
@@ -371,18 +479,28 @@ else
 
     LISTENER_ID=""
     while [ -z "$LISTENER_ID" ]; do
-        read -p "  Enter listener ID: " LISTENER_ID
-        if ! echo "$LISTENER_ID" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+        prompt LISTENER_ID "  Enter listener ID: "
+        if [ -n "$LISTENER_ID" ] && ! echo "$LISTENER_ID" | grep -qE '^[a-zA-Z0-9_-]+$'; then
             echo "  Invalid: use only letters, numbers, hyphens, underscores"
             LISTENER_ID=""
         fi
     done
 
-    read -p "  Enter listener location (e.g. Montreal, QC): " LISTENER_LOCATION
+    prompt LISTENER_LOCATION "  Enter listener location (e.g. Montreal, QC): "
     LISTENER_LOCATION="${LISTENER_LOCATION:-Unknown}"
 
-    read -p "  Enter owner name (e.g. J. Smith): " LISTENER_OWNER
+    prompt LISTENER_OWNER "  Enter owner name (e.g. J. Smith): "
     LISTENER_OWNER="${LISTENER_OWNER:-Unknown}"
+
+    # Enable dongle 2 only if a second one was actually detected in step 4.
+    # The daemon reads these flags -- leaving DONGLE2 enabled on a one-dongle
+    # listener puts rtl_airband into a permanent restart loop.
+    if [ "${DONGLE_COUNT:-0}" -ge 2 ]; then
+        DONGLE2_ENABLED_VALUE=true
+    else
+        DONGLE2_ENABLED_VALUE=false
+    fi
+    log_info "Configuring for ${DONGLE_COUNT:-0} dongle(s) (dongle 2 enabled: $DONGLE2_ENABLED_VALUE)"
 
     # Write initial config (API key and central URL added in step 9)
     cat > "$LISTENER_CONF" << CONFEOF
@@ -401,7 +519,7 @@ DONGLE1_ENABLED=true
 
 # Dongle 2 -- 931 MHz cluster
 DONGLE2_SERIAL="931MHz"
-DONGLE2_ENABLED=false
+DONGLE2_ENABLED=${DONGLE2_ENABLED_VALUE}
 
 # Central dashboard server (set by self-registration)
 CENTRAL_URL=""
@@ -413,6 +531,9 @@ REMOTE_HOST=""
 REMOTE_DIR=""
 TRANSFER_ENABLED=false
 CONFEOF
+
+    # Contains the central API key once registration completes
+    chmod 600 "$LISTENER_CONF"
 
     log_info "Created listener config with ID: $LISTENER_ID"
 fi
@@ -440,11 +561,11 @@ else
     echo "  Leave blank to skip (you can register later)."
     echo ""
 
-    read -p "  Enter registration token (or press Enter to skip): " REG_TOKEN
+    prompt REG_TOKEN "  Enter registration token (or press Enter to skip): "
 
     if [ -n "$REG_TOKEN" ]; then
         # Ask for server URL if not already known
-        read -p "  Enter server URL (default: https://pagevault.yoshee.me): " SERVER_URL
+        prompt SERVER_URL "  Enter server URL (default: https://pagevault.yoshee.me): "
         SERVER_URL="${SERVER_URL:-https://pagevault.yoshee.me}"
         # Strip trailing slash
         SERVER_URL="${SERVER_URL%/}"
@@ -473,11 +594,15 @@ print(json.dumps({
 }))
 " "$REG_TOKEN" "$LISTENER_ID" "$LISTENER_LOCATION" "$LISTENER_OWNER" "$SSH_PUBKEY")
 
-        # Call registration API
-        RESPONSE=$(curl -s -X POST \
+        # Call registration API. `set -e` would abort the whole run on a
+        # failed command substitution, so capture the exit status instead --
+        # an unreachable server should fall through to the "register later"
+        # path below, not tear down a completed install.
+        CURL_RC=0
+        RESPONSE=$(curl -s --connect-timeout 10 --max-time 60 -X POST \
             -H "Content-Type: application/json" \
             -d "$JSON_PAYLOAD" \
-            "$REG_URL")
+            "$REG_URL") || CURL_RC=$?
 
         # Parse response
         STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
@@ -487,7 +612,10 @@ print(json.dumps({
         SFTP_HOST=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sftp_host',''))" 2>/dev/null || echo "")
         ERROR_MSG=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null || echo "unknown error")
 
-        if [ "$STATUS" = "ok" ] && [ -n "$API_KEY" ]; then
+        if [ "$CURL_RC" -ne 0 ]; then
+            log_error "Could not reach $REG_URL (curl exit $CURL_RC)"
+            log_warn "Register later by re-running setup once the server is reachable"
+        elif [ "$STATUS" = "ok" ] && [ -n "$API_KEY" ]; then
             log_info "Registration successful!"
 
             # Update listener.conf with server details
@@ -498,14 +626,19 @@ print(json.dumps({
             sed -i "s|^REMOTE_DIR=.*|REMOTE_DIR=\"/var/pagevault/logs\"|" "$LISTENER_CONF"
             sed -i "s|^TRANSFER_ENABLED=.*|TRANSFER_ENABLED=true|" "$LISTENER_CONF"
 
+            chmod 600 "$LISTENER_CONF"
+
             log_info "Config updated with API key and server details"
             log_info "Heartbeat URL: $HEARTBEAT_URL"
             log_info "SFTP: $SFTP_USER@$SFTP_HOST"
 
             # Pre-accept VPS host key so sftp doesn't prompt in cron
             if [ -n "$SFTP_HOST" ]; then
-                ssh-keyscan -H "$SFTP_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
-                log_info "VPS host key added to known_hosts"
+                if ssh-keyscan -H "$SFTP_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null; then
+                    log_info "VPS host key added to known_hosts"
+                else
+                    log_warn "Could not fetch host key for $SFTP_HOST -- first sftp run may fail"
+                fi
             fi
 
             # Re-source the updated config
@@ -582,28 +715,84 @@ fi
 
 log_info "Step 11/11: Daemon startup"
 
-DAEMON_SCRIPT="$PAGEVAULT_SCRIPTS/pagevault_daemon_${DAEMON_VERSION}.py"
+# Resolve the daemon the same way the control script does -- newest by
+# version -- so shipping a new daemon never needs a constant bumped here.
+DAEMON_SCRIPT=$(ls "$PAGEVAULT_SCRIPTS"/pagevault_daemon_v*.py 2>/dev/null | sort -V | tail -1)
 
-if [ -f "$DAEMON_SCRIPT" ]; then
-    echo ""
-    read -p "  Start the daemon now? (y/n): " START_NOW
-    if [ "$START_NOW" = "y" ] || [ "$START_NOW" = "Y" ]; then
-        "$PAGEVAULT_SCRIPTS/pagevault" start
-    fi
-
-    # Auto-start on boot
-    read -p "  Enable auto-start on boot? (y/n): " AUTO_START
-    if [ "$AUTO_START" = "y" ] || [ "$AUTO_START" = "Y" ]; then
-        if crontab -l 2>/dev/null | grep -q "pagevault_daemon"; then
-            log_info "Auto-start already configured"
-        else
-            (crontab -l 2>/dev/null; echo "# PageVault -- auto-start daemon on boot (60s delay for system init)") | crontab -
-            (crontab -l 2>/dev/null; echo "@reboot sleep 60 && /usr/local/bin/pagevault start >> $PAGEVAULT_STATE/daemon.log 2>&1") | crontab -
-            log_info "Auto-start on boot configured (60s delay after boot)"
-        fi
-    fi
+if [ -z "$DAEMON_SCRIPT" ]; then
+    log_warn "No daemon script found in $PAGEVAULT_SCRIPTS -- cannot start"
 else
-    log_warn "Daemon script not found at $DAEMON_SCRIPT -- cannot start"
+    log_info "Daemon: $(basename "$DAEMON_SCRIPT")"
+
+    # Startup is handled by a systemd user unit, not @reboot cron.
+    #
+    # The daemon drives pactl and parec, so it needs a live PulseAudio/PipeWire
+    # session. A cron job has neither XDG_RUNTIME_DIR nor DBUS_SESSION_BUS_ADDRESS
+    # and runs with a PATH that excludes /usr/local/bin, where rtl_airband is
+    # installed -- so the old @reboot entry could not have worked. A user unit
+    # gets the session and a correct PATH; lingering brings that session up at
+    # boot without requiring anyone to log in.
+
+    # Drop the obsolete cron auto-start from earlier installs either way
+    if crontab -l 2>/dev/null | grep -q "@reboot.*pagevault"; then
+        crontab -l 2>/dev/null \
+            | grep -v "@reboot.*pagevault" \
+            | grep -v "auto-start daemon on boot" \
+            | crontab -
+        log_info "Removed obsolete @reboot cron auto-start (superseded by systemd)"
+    fi
+
+    if command -v systemctl > /dev/null 2>&1 && systemctl --user show-environment > /dev/null 2>&1; then
+        SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+        UNIT_FILE="$SYSTEMD_USER_DIR/pagevault.service"
+
+        mkdir -p "$SYSTEMD_USER_DIR"
+        cat > "$UNIT_FILE" << UNITEOF
+[Unit]
+Description=PageVault listener daemon
+After=default.target pipewire-pulse.service pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pagevault run
+Restart=always
+RestartSec=10
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target
+UNITEOF
+
+        systemctl --user daemon-reload || log_warn "systemctl --user daemon-reload failed"
+        log_info "Installed systemd user unit: $UNIT_FILE"
+
+        echo ""
+        prompt AUTO_START "  Enable auto-start on boot? (y/n): "
+        if [ "$AUTO_START" = "y" ] || [ "$AUTO_START" = "Y" ]; then
+            if systemctl --user enable pagevault.service > /dev/null 2>&1; then
+                # Without lingering, the user session -- and PipeWire with it --
+                # only starts at graphical login, so a headless box never comes up
+                if sudo loginctl enable-linger "$USER" 2>/dev/null; then
+                    log_info "Auto-start enabled (lingering on: starts at boot without login)"
+                else
+                    log_warn "Unit enabled, but could not turn on lingering for $USER"
+                    log_warn "The daemon will only start after a graphical login"
+                fi
+            else
+                log_warn "Could not enable pagevault.service"
+            fi
+        fi
+    else
+        log_warn "No systemd user session available -- skipping auto-start setup"
+        log_warn "Start the daemon manually with: pagevault start"
+    fi
+
+    echo ""
+    prompt START_NOW "  Start the daemon now? (y/n): "
+    if [ "$START_NOW" = "y" ] || [ "$START_NOW" = "Y" ]; then
+        # A failed (or already-running) start must not abort setup before the summary
+        "$PAGEVAULT_SCRIPTS/pagevault" start || log_warn "Daemon did not start -- check: pagevault status"
+    fi
 fi
 
 # ============================================================
@@ -635,14 +824,28 @@ echo "     pagevault start     Start the daemon"
 echo "     pagevault stop      Stop the daemon"
 echo "     pagevault restart   Restart the daemon"
 echo "     pagevault status    Show current status"
+echo "     pagevault update    Pull latest scripts and restart"
 
 echo ""
 echo "  Check status:"
 echo "     watch -n 5 cat $PAGEVAULT_STATE/status.txt"
 echo ""
 echo "  To update scripts later:"
-echo "     $PAGEVAULT_SCRIPTS/update.sh"
+echo "     pagevault update"
 echo ""
+
+if [ -f "$HOME/.config/systemd/user/pagevault.service" ]; then
+    if systemctl --user is-enabled pagevault.service > /dev/null 2>&1; then
+        echo "  Auto-start: ENABLED (systemd user unit)"
+        if ! loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q "Linger=yes"; then
+            echo -e "  ${YELLOW}NOTE: lingering is off -- daemon starts only after login${NC}"
+        fi
+    else
+        echo "  Auto-start: not enabled (systemctl --user enable pagevault.service)"
+    fi
+    echo "  Unit logs: journalctl --user -u pagevault -f"
+    echo ""
+fi
 
 if ! groups "$USER" | grep -q "plugdev"; then
     echo -e "  ${YELLOW}IMPORTANT: Log out and back in for USB permissions${NC}"

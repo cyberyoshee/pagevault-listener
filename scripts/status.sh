@@ -1,6 +1,6 @@
 #!/bin/bash
 # PageVault status - quick view of what's happening
-# Compatible with daemon v2.8+
+# Compatible with daemon v2.8+ (v2.9 status format unchanged)
 
 BASE_DIR="$HOME/pagevault"
 

@@ -1,13 +1,41 @@
 #!/bin/bash
 # PageVault daemon control
-# Usage: pagevault start|stop|restart|status
+# Usage: pagevault start|stop|restart|status|update|run
 
 SCRIPTS="$HOME/pagevault/scripts"
 STATE="$HOME/pagevault/state"
+UNIT="pagevault.service"
+UNIT_FILE="$HOME/.config/systemd/user/$UNIT"
+
+# rtl_airband installs to /usr/local/bin. Minimal environments (cron, systemd)
+# leave that off PATH, and the daemon invokes rtl_airband by bare name.
+export PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+
 DAEMON=$(ls "$SCRIPTS"/pagevault_daemon_v*.py 2>/dev/null | sort -V | tail -1)
+
+# Prefer systemd whenever the user unit is installed. It owns the process,
+# restarts it on failure, and kills the whole cgroup (rtl_airband, parec, sox,
+# multimon-ng) on stop. Running nohup/pkill alongside Restart=always would just
+# fight the supervisor.
+use_systemd() {
+    [ -f "$UNIT_FILE" ] \
+        && command -v systemctl > /dev/null 2>&1 \
+        && systemctl --user show-environment > /dev/null 2>&1
+}
 
 case "${1:-}" in
     start)
+        if use_systemd; then
+            systemctl --user start "$UNIT"
+            sleep 3
+            if systemctl --user is-active --quiet "$UNIT"; then
+                echo "Started (systemd: $UNIT)"
+                exit 0
+            fi
+            echo "Failed to start. Check: journalctl --user -u pagevault -n 50"
+            exit 1
+        fi
+
         if pgrep -f pagevault_daemon > /dev/null; then
             echo "Daemon already running (PID: $(pgrep -f pagevault_daemon | head -1))"
             exit 1
@@ -26,6 +54,11 @@ case "${1:-}" in
         fi
         ;;
     stop)
+        if use_systemd; then
+            systemctl --user stop "$UNIT"
+            echo "Stopped (systemd: $UNIT)"
+            exit 0
+        fi
         pkill -f pagevault_daemon 2>/dev/null
         pkill -f rtl_airband 2>/dev/null
         pkill -f "parec.*pv_" 2>/dev/null
@@ -34,11 +67,31 @@ case "${1:-}" in
         echo "Stopped"
         ;;
     restart)
+        if use_systemd; then
+            systemctl --user restart "$UNIT"
+            echo "Restarted (systemd: $UNIT)"
+            exit 0
+        fi
         $0 stop
         sleep 2
         $0 start
         ;;
+    run)
+        # Foreground daemon. This is the ExecStart target of the systemd user
+        # unit, which is why version resolution lives here and not in the unit
+        # file -- a daemon version bump must not require rewriting the unit.
+        if [ -z "$DAEMON" ]; then
+            echo "No daemon script found in $SCRIPTS"
+            exit 1
+        fi
+        exec python3 "$DAEMON"
+        ;;
     status)
+        if use_systemd; then
+            systemctl --user is-active "$UNIT" > /dev/null 2>&1 \
+                && echo "Unit: $UNIT active" \
+                || echo "Unit: $UNIT inactive"
+        fi
         if [ -f "$SCRIPTS/status.sh" ]; then
             "$SCRIPTS/status.sh"
         elif [ -f "$STATE/status.txt" ]; then
@@ -48,6 +101,7 @@ case "${1:-}" in
         fi
         ;;
     update)
+        # setup.sh --update restarts the daemon itself once scripts are in place
         if [ -f "$SCRIPTS/update.sh" ]; then
             "$SCRIPTS/update.sh"
         elif [ -f "$SCRIPTS/setup.sh" ]; then
@@ -56,14 +110,9 @@ case "${1:-}" in
             echo "No update script found in $SCRIPTS"
             exit 1
         fi
-        # Restart daemon if it was running to pick up new code
-        if pgrep -f pagevault_daemon > /dev/null; then
-            echo "Restarting daemon to apply updates..."
-            $0 restart
-        fi
         ;;
     *)
-        echo "Usage: pagevault start|stop|restart|status|update"
+        echo "Usage: pagevault start|stop|restart|status|update|run"
         exit 1
         ;;
 esac

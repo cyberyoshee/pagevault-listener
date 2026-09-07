@@ -3,10 +3,18 @@
 PageVault Daemon
 ================
 
-VERSION: 2.8
+VERSION: 2.9
 
 CHANGELOG
 ---------
+v2.9 (2026-09-07)
+  - Dongles are now driven by DONGLE<N>_ENABLED in config/listener.conf
+    instead of being unconditionally hardcoded. A single-dongle listener no
+    longer spins rtl_airband and six decoder threads in a permanent restart
+    loop for hardware it does not have.
+  - DONGLE<N>_SERIAL in the config overrides the built-in serial
+  - Config is read once at startup and passed down, not re-read per lookup
+
 v2.8 (2026-09-06)
   - Message counters (per-channel and total) reset at midnight UTC
   - Dashboard always shows today's message count
@@ -232,9 +240,8 @@ def read_listener_config():
 
     return config
 
-def get_listener_id():
-    """Read LISTENER_ID from config. Exit if not set."""
-    config = read_listener_config()
+def get_listener_id(config):
+    """Return LISTENER_ID from a parsed config. Exit if not set."""
     listener_id = config.get("LISTENER_ID", "").strip()
 
     if not listener_id:
@@ -251,6 +258,35 @@ def get_listener_id():
         sys.exit(1)
 
     return listener_id
+
+def get_enabled_dongles(config):
+    """Filter DONGLES using the DONGLE<N>_* keys in listener.conf.
+
+    Keys are positional and 1-indexed: DONGLE1_* describes DONGLES[0]. A dongle
+    with no matching DONGLE<N>_ENABLED key defaults to enabled, so a config
+    written before these keys existed keeps its old behaviour.
+    """
+    enabled = []
+
+    for idx, dongle in enumerate(DONGLES, start=1):
+        flag = config.get(f"DONGLE{idx}_ENABLED")
+        if flag is not None and flag.strip().lower() != "true":
+            log.info(f"Dongle {idx} ({dongle['serial']}) disabled in config, skipping")
+            continue
+
+        serial = config.get(f"DONGLE{idx}_SERIAL", "").strip()
+        if serial and serial != dongle["serial"]:
+            log.info(f"Dongle {idx}: serial overridden by config: '{serial}'")
+            dongle = {**dongle, "serial": serial}
+
+        enabled.append(dongle)
+
+    if not enabled:
+        log.error("No dongles enabled in config/listener.conf -- nothing to do")
+        log.error("Set DONGLE1_ENABLED=true (and DONGLE2_ENABLED=true if fitted)")
+        sys.exit(1)
+
+    return enabled
 
 # ============================================================
 # PULSEAUDIO SETUP
@@ -694,14 +730,16 @@ def main():
     ensure_directories()
     log = setup_logging()
 
-    listener_id = get_listener_id()
+    config = read_listener_config()
+    listener_id = get_listener_id(config)
+    dongles = get_enabled_dongles(config)
 
     log.info("=" * 60)
-    log.info("PageVault daemon v2.8 starting")
+    log.info("PageVault daemon v2.9 starting")
     log.info(f"Listener ID: {listener_id}")
     log.info(f"Base directory: {BASE_DIR}")
-    log.info(f"Dongles configured: {len(DONGLES)}")
-    for d in DONGLES:
+    log.info(f"Dongles enabled: {len(dongles)} of {len(DONGLES)} configured")
+    for d in dongles:
         log.info(f"  - {d['serial']}: {d['center_freq_mhz']} MHz, {len(d['channels'])} channels")
         for freq, name, sink in d['channels']:
             log.info(f"      {freq} Hz -> {name} (sink: {sink})")
@@ -720,7 +758,7 @@ def main():
     t.start()
     threads.append(t)
 
-    for dongle_config in DONGLES:
+    for dongle_config in dongles:
         create_pulse_sinks(dongle_config)
 
         t = threading.Thread(
