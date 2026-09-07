@@ -47,7 +47,8 @@ PAGEVAULT_HOME="$HOME/pagevault"
 PAGEVAULT_SCRIPTS="$PAGEVAULT_HOME/scripts"
 PAGEVAULT_CONFIG="$PAGEVAULT_HOME/config"
 PAGEVAULT_STATE="$PAGEVAULT_HOME/state"
-AIRBAND_BUILD_DIR="$HOME/RTLSDR-Airband"
+AIRBAND_BUILD_DIR="$PAGEVAULT_HOME/build/RTLSDR-Airband"
+AIRBAND_BUILD_DIR_LEGACY="$HOME/RTLSDR-Airband"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -375,6 +376,16 @@ else
 fi
 
 if [ "${REBUILD_AIRBAND:-false}" = true ] || ! command -v rtl_airband &> /dev/null; then
+    mkdir -p "$(dirname "$AIRBAND_BUILD_DIR")"
+
+    # Setups before this change built in $HOME/RTLSDR-Airband. Reuse that clone
+    # rather than re-fetching the whole upstream tree; step 5 wipes build/ and
+    # reconfigures from scratch anyway, so no stale cmake state carries over.
+    if [ -d "$AIRBAND_BUILD_DIR_LEGACY" ] && [ ! -d "$AIRBAND_BUILD_DIR" ]; then
+        mv "$AIRBAND_BUILD_DIR_LEGACY" "$AIRBAND_BUILD_DIR"
+        log_info "Moved existing build tree from $AIRBAND_BUILD_DIR_LEGACY"
+    fi
+
     if [ -d "$AIRBAND_BUILD_DIR" ]; then
         cd "$AIRBAND_BUILD_DIR"
         git pull origin master 2>/dev/null || true
