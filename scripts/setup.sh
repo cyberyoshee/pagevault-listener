@@ -10,10 +10,10 @@
 #   1. Installs system dependencies (apt packages)
 #   2. Blacklists DVB kernel driver for RTL-SDR access
 #   3. Configures USB permissions for non-root SDR access
-#   4. Auto-detects and configures RTL-SDR dongle serial numbers
-#   5. Builds and installs RTLSDR-Airband with NFM + PulseAudio
-#   6. Creates directory structure
-#   7. Pulls latest PageVault scripts from the repository
+#   4. Creates directory structure
+#   5. Pulls latest PageVault scripts from the repository
+#   6. Assigns a frequency block to each dongle, one dongle at a time
+#   7. Builds and installs RTLSDR-Airband with NFM + PulseAudio
 #   8. Creates listener config (interactive prompts)
 #   9. Self-registers with central server (registration token)
 #  10. Sets up cron jobs (status push, log transfer)
@@ -310,59 +310,302 @@ else
 fi
 
 # ----------------------------------------------------------
-# STEP 4: Auto-detect and configure RTL-SDR dongles
+# STEP 4: Create directory structure
 # ----------------------------------------------------------
 
-log_info "Step 4/11: Detecting and configuring RTL-SDR dongles"
+log_info "Step 4/11: Creating directory structure"
 
-DONGLE_SERIALS=("929MHz" "931MHz")
-sudo rmmod dvb_usb_rtl28xxu 2>/dev/null || true
-DONGLE_COUNT=$(lsusb | grep -c "0bda:2838" || true)
+mkdir -p "$PAGEVAULT_HOME/scripts"
+mkdir -p "$PAGEVAULT_HOME/logs/processing"
+mkdir -p "$PAGEVAULT_HOME/logs/ready"
+mkdir -p "$PAGEVAULT_HOME/logs/archived"
+mkdir -p "$PAGEVAULT_HOME/state"
+mkdir -p "$PAGEVAULT_HOME/config"
 
-if [ "$DONGLE_COUNT" -eq 0 ]; then
-    log_warn "No RTL-SDR dongles detected -- plug them in and re-run setup"
+log_info "Directory structure created at $PAGEVAULT_HOME"
+
+# ----------------------------------------------------------
+# STEP 5: Pull latest scripts from repository
+# ----------------------------------------------------------
+
+log_info "Step 5/11: Pulling latest scripts"
+
+TEMP_REPO="$PAGEVAULT_HOME/.update-$$"
+trap 'rm -rf "$TEMP_REPO"' EXIT
+
+if echo "$REPO_URL" | grep -q "CHANGEME"; then
+    log_warn "Repository URL not configured in setup.sh"
+    log_warn "Skipping script pull -- copy scripts manually to $PAGEVAULT_SCRIPTS/"
 else
-    log_info "Found $DONGLE_COUNT RTL-SDR dongle(s)"
-
-    for i in $(seq 0 $((DONGLE_COUNT - 1))); do
-        EXPECTED_SERIAL="${DONGLE_SERIALS[$i]}"
-        CURRENT_SERIAL=$(rtl_test -d $i 2>&1 | grep "SN:" | head -1 | sed 's/.*SN: //' | tr -d ' ' || echo "unknown")
-
-        if [ "$CURRENT_SERIAL" = "$EXPECTED_SERIAL" ]; then
-            log_info "Dongle $i: serial already set to '$EXPECTED_SERIAL'"
+    if git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TEMP_REPO" 2>/dev/null; then
+        if [ -d "$TEMP_REPO/scripts" ]; then
+            install_scripts "$TEMP_REPO/scripts"
+            log_info "Scripts pulled from repository"
         else
-            log_info "Dongle $i: current serial '$CURRENT_SERIAL', setting to '$EXPECTED_SERIAL'"
-            rtl_eeprom -d $i -s "$EXPECTED_SERIAL" 2>/dev/null <<< "y" || true
-
-            USB_PATH=$(lsusb | grep "0bda:2838" | sed -n "$((i + 1))p" | awk '{print "/dev/bus/usb/" $2 "/" $4}' | tr -d ':')
-
-            if [ -n "$USB_PATH" ] && [ -e "$USB_PATH" ]; then
-                sudo python3 -c "
-import fcntl, os
-USBDEVFS_RESET = 21780
-fd = os.open('$USB_PATH', os.O_WRONLY)
-fcntl.ioctl(fd, USBDEVFS_RESET, 0)
-os.close(fd)
-" 2>/dev/null && log_info "Dongle $i: USB reset complete" || log_warn "Dongle $i: USB reset failed, may need physical unplug/replug"
-                sleep 2
-            else
-                log_warn "Dongle $i: could not find USB device path for reset"
-            fi
+            log_warn "No scripts directory found in repository"
         fi
-    done
+    else
+        log_warn "Could not clone $REPO_URL -- continuing with scripts already on disk"
+    fi
 
-    sleep 2
-    log_info "Verifying dongle configuration:"
-    rtl_test -t 2>&1 | grep -E "Found|Realtek|SN:" | while read line; do
-        log_info "  $line"
-    done
+    rm -rf "$TEMP_REPO"
+fi
+
+# Create system-wide 'pagevault' command (after scripts are pulled)
+if [ -f "$PAGEVAULT_SCRIPTS/pagevault" ]; then
+    sudo ln -sf "$PAGEVAULT_SCRIPTS/pagevault" /usr/local/bin/pagevault
+    log_info "Command 'pagevault' available system-wide"
 fi
 
 # ----------------------------------------------------------
-# STEP 5: Build and install RTLSDR-Airband
+# STEP 6: Dongle configuration
 # ----------------------------------------------------------
 
-log_info "Step 5/11: Building RTLSDR-Airband"
+log_info "Step 6/11: Dongle configuration"
+
+BLOCKS_PY="$PAGEVAULT_SCRIPTS/pagevault_blocks.py"
+DONGLES_CONF="$PAGEVAULT_CONFIG/dongles.conf"
+
+if [ ! -f "$BLOCKS_PY" ]; then
+    log_error "Block catalogue tool missing: $BLOCKS_PY"
+    log_error "The script pull in step 5 must have failed."
+    exit 1
+fi
+
+if ! python3 "$BLOCKS_PY" validate; then
+    log_error "Frequency block catalogue is invalid -- fix frequency_blocks.json"
+    exit 1
+fi
+
+# Number of RTL-SDR devices currently on the USB bus
+dongle_count() { lsusb | grep -c "0bda:2838" || true; }
+
+# "<index><TAB><serial>" for every attached dongle
+list_dongles() {
+    timeout 5 rtl_test 2>&1 \
+        | sed -n 's/^[[:space:]]*\([0-9]\{1,\}\):.*SN:[[:space:]]*\(.*\)$/\1\t\2/p' \
+        | sed 's/[[:space:]]*$//'
+}
+
+# An EEPROM write only takes effect once the device re-enumerates
+usb_reset_dongle() {
+    local idx="$1" path
+    path=$(lsusb | grep "0bda:2838" | sed -n "$((idx + 1))p" \
+        | awk '{print "/dev/bus/usb/" $2 "/" $4}' | tr -d ':')
+    if [ -n "$path" ] && [ -e "$path" ]; then
+        sudo python3 -c "
+import fcntl, os, sys
+USBDEVFS_RESET = 21780
+fd = os.open(sys.argv[1], os.O_WRONLY)
+fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+os.close(fd)
+" "$path" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+configure_dongles() {
+    require_interactive "Dongle configuration"
+
+    sudo rmmod dvb_usb_rtl28xxu 2>/dev/null || true
+
+    echo ""
+    echo "============================================================"
+    echo "  Dongle Configuration"
+    echo "============================================================"
+    echo ""
+    echo "  Each dongle is assigned one frequency block, and that block's"
+    echo "  serial is written to the dongle's EEPROM so the daemon can"
+    echo "  address it specifically."
+    echo ""
+    echo "  Dongles are configured ONE AT A TIME. With several attached"
+    echo "  at once, enumeration order is arbitrary and there is no way"
+    echo "  to tell which physical dongle -- and so which antenna -- is"
+    echo "  which."
+    echo ""
+
+    # Start from a known state: nothing attached
+    while [ "$(dongle_count)" -gt 0 ]; do
+        log_warn "$(dongle_count) dongle(s) currently attached"
+        prompt _UNPLUG "  Unplug ALL RTL-SDR dongles, then press Enter: "
+        sleep 1
+    done
+    log_info "Starting with no dongles attached"
+
+    local assigned_blocks="" assigned_serials="" dongle_lines=""
+    local attached=0 configured=0
+    local remaining menu_ids n choice block_id block_serial
+    local new_count waited new_index new_serial verified
+    local bid blabel bdesc bnch bcentre bchans idx ser
+
+    while true; do
+        remaining=$(python3 "$BLOCKS_PY" list --exclude "$assigned_blocks")
+        if [ -z "$remaining" ]; then
+            echo ""
+            log_info "Every block in the catalogue is now assigned"
+            break
+        fi
+
+        echo ""
+        echo "  ---- Dongle $((configured + 1)) ----"
+        echo "  Attach the next dongle now, then press Enter."
+        echo "  Or press Enter with nothing attached to finish."
+        prompt _GO "  > "
+
+        # Give USB a moment to enumerate
+        new_count=$(dongle_count)
+        waited=0
+        while [ "$new_count" -le "$attached" ] && [ "$waited" -lt 10 ]; do
+            sleep 1
+            waited=$((waited + 1))
+            new_count=$(dongle_count)
+        done
+
+        if [ "$new_count" -le "$attached" ]; then
+            echo ""
+            log_info "No new dongle detected -- finishing dongle configuration"
+            break
+        fi
+
+        # The new dongle is the one whose serial we have not just assigned
+        new_index=""
+        new_serial=""
+        while IFS="$(printf '\t')" read -r idx ser; do
+            [ -n "$idx" ] || continue
+            if ! printf '%s\n' "$assigned_serials" | grep -qxF "$ser"; then
+                new_index="$idx"
+                new_serial="$ser"
+                break
+            fi
+        done < <(list_dongles)
+
+        if [ -z "$new_index" ]; then
+            log_warn "Could not identify the newly attached dongle."
+            log_warn "It may already carry a serial assigned earlier in this run."
+            prompt _RETRY "  Unplug it, then press Enter to try again: "
+            continue
+        fi
+
+        echo ""
+        log_info "Detected dongle at index $new_index (current serial: '$new_serial')"
+        echo ""
+        echo "  Which frequency block should this dongle listen to?"
+        echo ""
+
+        menu_ids=()
+        n=0
+        while IFS="$(printf '\t')" read -r bid blabel bdesc bnch bcentre bchans; do
+            [ -n "$bid" ] || continue
+            n=$((n + 1))
+            menu_ids+=("$bid")
+            printf "    %d) %s -- %s\n" "$n" "$blabel" "$bdesc"
+            printf "       %s channels centered on %s MHz\n" "$bnch" "$bcentre"
+            printf "       %s\n\n" "$bchans"
+        done <<< "$remaining"
+
+        choice=""
+        while [ -z "$choice" ]; do
+            prompt choice "  Select block (1-$n): "
+            if ! echo "$choice" | grep -qE '^[0-9]+$' \
+                || [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
+                echo "  Enter a number between 1 and $n"
+                choice=""
+            fi
+        done
+
+        block_id="${menu_ids[$((choice - 1))]}"
+        block_serial=$(python3 "$BLOCKS_PY" field "$block_id" serial)
+
+        if [ "$new_serial" = "$block_serial" ]; then
+            log_info "Dongle already carries serial '$block_serial'"
+        else
+            log_info "Writing serial '$block_serial' to dongle $new_index"
+            rtl_eeprom -d "$new_index" -s "$block_serial" > /dev/null 2>&1 <<< "y" || true
+
+            if usb_reset_dongle "$new_index"; then
+                log_info "EEPROM written, USB reset complete"
+            else
+                log_warn "EEPROM written but the USB reset failed"
+                prompt _REPLUG "  Unplug and replug this dongle, then press Enter: "
+            fi
+            sleep 2
+        fi
+
+        verified=false
+        while IFS="$(printf '\t')" read -r idx ser; do
+            [ "$ser" = "$block_serial" ] && verified=true
+        done < <(list_dongles)
+
+        if [ "$verified" = true ]; then
+            log_info "Verified: a dongle now reports serial '$block_serial'"
+        else
+            log_warn "Could not verify serial '$block_serial' -- the daemon may not find this dongle"
+        fi
+
+        configured=$((configured + 1))
+        attached=$(dongle_count)
+        assigned_blocks="${assigned_blocks:+$assigned_blocks,}$block_id"
+        assigned_serials="${assigned_serials}${block_serial}
+"
+        dongle_lines="${dongle_lines}DONGLE_${configured}_BLOCK=\"$block_id\"
+DONGLE_${configured}_SERIAL=\"$block_serial\"
+"
+        log_info "Dongle $configured configured: block '$block_id'"
+    done
+
+    if [ "$configured" -eq 0 ]; then
+        log_warn "No dongles configured -- the daemon will not start until at least one is"
+    fi
+
+    mkdir -p "$PAGEVAULT_CONFIG"
+    {
+        echo "# ============================================================"
+        echo "# PageVault Dongle Assignments"
+        echo "# ============================================================"
+        echo "#"
+        echo "# Written by setup.sh -- one dongle per frequency block."
+        echo "# Block definitions live in scripts/frequency_blocks.json."
+        echo "#"
+        echo "# The serials below are written into each dongle's EEPROM, so"
+        echo "# re-run setup.sh to change assignments rather than editing"
+        echo "# this file by hand."
+        echo ""
+        echo "DONGLE_COUNT=$configured"
+        printf '%s' "$dongle_lines"
+    } > "$DONGLES_CONF"
+
+    log_info "Wrote $DONGLES_CONF ($configured dongle(s))"
+}
+
+RECONFIGURE_DONGLES=true
+
+if [ -f "$DONGLES_CONF" ]; then
+    # shellcheck disable=SC1090
+    source "$DONGLES_CONF"
+    echo ""
+    log_info "Existing dongle configuration (${DONGLE_COUNT:-0} dongle(s)):"
+    for i in $(seq 1 "${DONGLE_COUNT:-0}"); do
+        _bvar="DONGLE_${i}_BLOCK"
+        _svar="DONGLE_${i}_SERIAL"
+        log_info "  $i. block '${!_bvar}' (serial ${!_svar})"
+    done
+    echo ""
+    prompt RECONF "  Reconfigure dongles? (y/n): "
+    if [ "$RECONF" != "y" ] && [ "$RECONF" != "Y" ]; then
+        RECONFIGURE_DONGLES=false
+        log_info "Keeping existing dongle configuration"
+    fi
+fi
+
+if [ "$RECONFIGURE_DONGLES" = true ]; then
+    configure_dongles
+fi
+
+# ----------------------------------------------------------
+# STEP 7: Build and install RTLSDR-Airband
+# ----------------------------------------------------------
+
+log_info "Step 7/11: Building RTLSDR-Airband"
 
 if command -v rtl_airband &> /dev/null; then
     if ldd "$(which rtl_airband)" | grep -q "libpulse"; then
@@ -408,54 +651,6 @@ fi
 log_info "RTLSDR-Airband verified: NFM + PulseAudio enabled"
 
 # ----------------------------------------------------------
-# STEP 6: Create directory structure
-# ----------------------------------------------------------
-
-log_info "Step 6/11: Creating directory structure"
-
-mkdir -p "$PAGEVAULT_HOME/scripts"
-mkdir -p "$PAGEVAULT_HOME/logs/processing"
-mkdir -p "$PAGEVAULT_HOME/logs/ready"
-mkdir -p "$PAGEVAULT_HOME/logs/archived"
-mkdir -p "$PAGEVAULT_HOME/state"
-mkdir -p "$PAGEVAULT_HOME/config"
-
-log_info "Directory structure created at $PAGEVAULT_HOME"
-
-# ----------------------------------------------------------
-# STEP 7: Pull latest scripts from repository
-# ----------------------------------------------------------
-
-log_info "Step 7/11: Pulling latest scripts"
-
-TEMP_REPO="$PAGEVAULT_HOME/.update-$$"
-trap 'rm -rf "$TEMP_REPO"' EXIT
-
-if echo "$REPO_URL" | grep -q "CHANGEME"; then
-    log_warn "Repository URL not configured in setup.sh"
-    log_warn "Skipping script pull -- copy scripts manually to $PAGEVAULT_SCRIPTS/"
-else
-    if git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TEMP_REPO" 2>/dev/null; then
-        if [ -d "$TEMP_REPO/scripts" ]; then
-            install_scripts "$TEMP_REPO/scripts"
-            log_info "Scripts pulled from repository"
-        else
-            log_warn "No scripts directory found in repository"
-        fi
-    else
-        log_warn "Could not clone $REPO_URL -- continuing with scripts already on disk"
-    fi
-
-    rm -rf "$TEMP_REPO"
-fi
-
-# Create system-wide 'pagevault' command (after scripts are pulled)
-if [ -f "$PAGEVAULT_SCRIPTS/pagevault" ]; then
-    sudo ln -sf "$PAGEVAULT_SCRIPTS/pagevault" /usr/local/bin/pagevault
-    log_info "Command 'pagevault' available system-wide"
-fi
-
-# ----------------------------------------------------------
 # STEP 8: Create listener config if not exists
 # ----------------------------------------------------------
 
@@ -467,14 +662,6 @@ if [ -f "$LISTENER_CONF" ]; then
     log_info "Listener config already exists, not overwriting"
     # Holds the central API key -- tighten perms on configs from older setups
     chmod 600 "$LISTENER_CONF"
-
-    # Migration: setups before v2.9 always wrote DONGLE2_ENABLED=false, and the
-    # daemon ignored the flag and drove both dongles anyway. Now that the flag
-    # is honoured, a stale 'false' would silently drop a working second dongle.
-    if [ "${DONGLE_COUNT:-0}" -ge 2 ] && grep -q '^DONGLE2_ENABLED=false' "$LISTENER_CONF"; then
-        sed -i 's|^DONGLE2_ENABLED=.*|DONGLE2_ENABLED=true|' "$LISTENER_CONF"
-        log_info "Second dongle detected -- enabled DONGLE2 in existing config"
-    fi
 else
     require_interactive "Listener configuration"
     echo ""
@@ -503,16 +690,6 @@ else
     prompt LISTENER_OWNER "  Enter owner name (e.g. J. Smith): "
     LISTENER_OWNER="${LISTENER_OWNER:-Unknown}"
 
-    # Enable dongle 2 only if a second one was actually detected in step 4.
-    # The daemon reads these flags -- leaving DONGLE2 enabled on a one-dongle
-    # listener puts rtl_airband into a permanent restart loop.
-    if [ "${DONGLE_COUNT:-0}" -ge 2 ]; then
-        DONGLE2_ENABLED_VALUE=true
-    else
-        DONGLE2_ENABLED_VALUE=false
-    fi
-    log_info "Configuring for ${DONGLE_COUNT:-0} dongle(s) (dongle 2 enabled: $DONGLE2_ENABLED_VALUE)"
-
     # Write initial config (API key and central URL added in step 9)
     cat > "$LISTENER_CONF" << CONFEOF
 # ============================================================
@@ -524,13 +701,8 @@ LISTENER_ID="${LISTENER_ID}"
 LISTENER_LOCATION="${LISTENER_LOCATION}"
 LISTENER_OWNER="${LISTENER_OWNER}"
 
-# Dongle 1 -- 929 MHz cluster
-DONGLE1_SERIAL="929MHz"
-DONGLE1_ENABLED=true
-
-# Dongle 2 -- 931 MHz cluster
-DONGLE2_SERIAL="931MHz"
-DONGLE2_ENABLED=${DONGLE2_ENABLED_VALUE}
+# Dongle assignments live in config/dongles.conf, written by setup.sh.
+# Frequency blocks are defined in scripts/frequency_blocks.json.
 
 # Central dashboard server (set by self-registration)
 CENTRAL_URL=""

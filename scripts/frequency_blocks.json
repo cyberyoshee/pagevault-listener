@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+
+  "_comment": [
+    "Frequency blocks a listener can assign to a dongle. One dongle covers one",
+    "block, and setup.sh offers these as the menu when a dongle is attached.",
+    "",
+    "A block is one rtl_airband device: a single center frequency with all of",
+    "its channels demodulated from that one tuner. Channels are therefore",
+    "grouped by proximity -- every channel in a block must fall inside the",
+    "tuner's usable span around center_freq_mhz (max_span_mhz below).",
+    "",
+    "To add a block: give it a unique id, serial and channel names, set",
+    "center_freq_mhz to the midpoint of its channels, and run",
+    "  python3 pagevault_blocks.py validate",
+    "which checks the span, the uniqueness rules and the serial length.",
+    "",
+    "serial is written to the dongle's EEPROM so rtl_airband can address that",
+    "physical device. Keep it short and unique across blocks.",
+    "",
+    "PulseAudio sink names are derived as pv_<channel name>, so channel names",
+    "must be unique across every block, not just within one."
+  ],
+
+  "max_span_mhz": 2.4,
+  "default_gain": 49.6,
+
+  "blocks": [
+    {
+      "id": "929",
+      "label": "929 MHz cluster",
+      "description": "Telepage, PageNet, Bell",
+      "serial": "pv929",
+      "center_freq_mhz": 929.5,
+      "channels": [
+        { "freq_hz": 929187500, "name": "telepage" },
+        { "freq_hz": 929287500, "name": "pagenet" },
+        { "freq_hz": 929662500, "name": "bell929" }
+      ]
+    },
+    {
+      "id": "931",
+      "label": "931 MHz cluster",
+      "description": "Rogers, Telus/Bell",
+      "serial": "pv931",
+      "center_freq_mhz": 931.8,
+      "channels": [
+        { "freq_hz": 931612500, "name": "rogers1" },
+        { "freq_hz": 931687500, "name": "rogers2" },
+        { "freq_hz": 931737500, "name": "telus_bell" },
+        { "freq_hz": 931887500, "name": "bell931" },
+        { "freq_hz": 931937500, "name": "rogers3" },
+        { "freq_hz": 931987500, "name": "rogers4" }
+      ]
+    }
+  ]
+}

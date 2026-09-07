@@ -1,6 +1,6 @@
 #!/bin/bash
 # PageVault status - quick view of what's happening
-# Compatible with daemon v2.8+ (v2.10 adds disk fields to status.txt)
+# Compatible with daemon v2.8+ (v2.10 added disk fields to status.txt)
 
 BASE_DIR="$HOME/pagevault"
 

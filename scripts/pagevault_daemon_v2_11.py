@@ -3,10 +3,19 @@
 PageVault Daemon
 ================
 
-VERSION: 2.10
+VERSION: 2.11
 
 CHANGELOG
 ---------
+v2.11 (2026-09-07)
+  - Dongles are described by config/dongles.conf plus the frequency block
+    catalogue in frequency_blocks.json, not by a hardcoded list. Any number
+    of dongles is supported, each assigned one block by setup.sh.
+  - Channel/frequency definitions are data, so adding coverage is a
+    catalogue edit rather than a daemon change
+  - Refuses to start on a pre-2.11 config instead of guessing, since the
+    old DONGLE1_/DONGLE2_ keys carry no block assignment
+
 v2.10 (2026-09-07)
   - Disk management. Nothing rotated or pruned before this, and the
     DISK_PAUSE_THRESHOLD_PCT constant was never referenced, so the disk
@@ -102,6 +111,9 @@ import subprocess
 import shutil
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pagevault_blocks as blocks
 from datetime import datetime, timezone
 from queue import Queue, Empty
 
@@ -152,34 +164,15 @@ CRON_LOG_MAX_BYTES = 2 * 1024 * 1024
 CRON_LOGS = ("push.log", "transfer.log")
 
 # ============================================================
-# DONGLE AND CHANNEL CONFIGURATION
+# DONGLE CONFIGURATION
 # ============================================================
+#
+# Dongles are not described here. setup.sh assigns each physical dongle one
+# frequency block and records that in config/dongles.conf; the block itself
+# (center frequency, gain, channels) lives in frequency_blocks.json. Adding
+# coverage is therefore a catalogue edit, not a code change.
 
-DONGLES = [
-    {
-        "serial": "929MHz",
-        "center_freq_mhz": 929.5,
-        "gain": 49.6,
-        "channels": [
-            (929_187_500, "telepage", "pv_telepage"),
-            (929_287_500, "pagenet", "pv_pagenet"),
-            (929_662_500, "bell929", "pv_bell929"),
-        ],
-    },
-    {
-        "serial": "931MHz",
-        "center_freq_mhz": 931.8,
-        "gain": 49.6,
-        "channels": [
-            (931_612_500, "rogers1", "pv_rogers1"),
-            (931_687_500, "rogers2", "pv_rogers2"),
-            (931_737_500, "telus_bell", "pv_telus_bell"),
-            (931_887_500, "bell931", "pv_bell931"),
-            (931_937_500, "rogers3", "pv_rogers3"),
-            (931_987_500, "rogers4", "pv_rogers4"),
-        ],
-    },
-]
+DONGLES_CONF_NAME = "dongles.conf"
 
 # ============================================================
 # LOGGING SETUP
@@ -427,34 +420,85 @@ def get_listener_id(config):
 
     return listener_id
 
-def get_enabled_dongles(config):
-    """Filter DONGLES using the DONGLE<N>_* keys in listener.conf.
+def read_dongle_config():
+    """Read config/dongles.conf, the dongle assignments written by setup.sh."""
+    path = CONFIG_DIR / DONGLES_CONF_NAME
 
-    Keys are positional and 1-indexed: DONGLE1_* describes DONGLES[0]. A dongle
-    with no matching DONGLE<N>_ENABLED key defaults to enabled, so a config
-    written before these keys existed keeps its old behaviour.
-    """
-    enabled = []
-
-    for idx, dongle in enumerate(DONGLES, start=1):
-        flag = config.get(f"DONGLE{idx}_ENABLED")
-        if flag is not None and flag.strip().lower() != "true":
-            log.info(f"Dongle {idx} ({dongle['serial']}) disabled in config, skipping")
-            continue
-
-        serial = config.get(f"DONGLE{idx}_SERIAL", "").strip()
-        if serial and serial != dongle["serial"]:
-            log.info(f"Dongle {idx}: serial overridden by config: '{serial}'")
-            dongle = {**dongle, "serial": serial}
-
-        enabled.append(dongle)
-
-    if not enabled:
-        log.error("No dongles enabled in config/listener.conf -- nothing to do")
-        log.error("Set DONGLE1_ENABLED=true (and DONGLE2_ENABLED=true if fitted)")
+    if not path.exists():
+        log.error(f"Dongle configuration not found: {path}")
+        # A pre-2.11 listener has its dongles described by DONGLE1_/DONGLE2_
+        # keys in listener.conf. Those carry no block assignment, so there is
+        # nothing to migrate from -- say so rather than guessing at coverage.
+        legacy = read_listener_config()
+        if any(k.startswith("DONGLE1_") or k.startswith("DONGLE2_") for k in legacy):
+            log.error("This listener still uses the pre-2.11 dongle format.")
+            log.error("Re-run setup.sh to assign a frequency block to each dongle.")
+        else:
+            log.error("Run setup.sh to assign a frequency block to each dongle.")
         sys.exit(1)
 
-    return enabled
+    config = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            config[key.strip()] = value.strip().strip('"').strip("'")
+
+    return config
+
+
+def get_dongles():
+    """Build the dongle list from the assignments plus the block catalogue."""
+    config = read_dongle_config()
+
+    try:
+        catalogue = blocks.load_catalogue()
+    except blocks.CatalogueError as e:
+        log.error(f"Frequency block catalogue: {e}")
+        sys.exit(1)
+
+    try:
+        count = int(config.get("DONGLE_COUNT", "0"))
+    except ValueError:
+        count = 0
+
+    if count <= 0:
+        log.error("No dongles configured -- run setup.sh to assign at least one")
+        sys.exit(1)
+
+    dongles = []
+    for i in range(1, count + 1):
+        block_id = config.get(f"DONGLE_{i}_BLOCK", "").strip()
+        serial = config.get(f"DONGLE_{i}_SERIAL", "").strip()
+
+        if not block_id:
+            log.error(f"DONGLE_{i}_BLOCK is missing from {DONGLES_CONF_NAME}")
+            sys.exit(1)
+
+        try:
+            block = blocks.get_block(block_id, catalogue)
+        except blocks.CatalogueError as e:
+            log.error(str(e))
+            log.error(f"Dongle {i} references a block that is not in the catalogue.")
+            log.error("Re-run setup.sh, or restore the block in frequency_blocks.json.")
+            sys.exit(1)
+
+        dongle = blocks.to_dongle_config(block, catalogue)
+
+        # The recorded serial is what was actually written to that dongle's
+        # EEPROM, so it wins over the catalogue default if they have drifted
+        if serial and serial != dongle["serial"]:
+            log.warning(
+                f"Dongle {i}: using recorded serial '{serial}' over catalogue "
+                f"default '{dongle['serial']}' for block '{block_id}'"
+            )
+            dongle["serial"] = serial
+
+        dongles.append(dongle)
+
+    return dongles
 
 # ============================================================
 # PULSEAUDIO SETUP
@@ -909,15 +953,18 @@ def main():
 
     config = read_listener_config()
     listener_id = get_listener_id(config)
-    dongles = get_enabled_dongles(config)
+    dongles = get_dongles()
 
     log.info("=" * 60)
-    log.info("PageVault daemon v2.10 starting")
+    log.info("PageVault daemon v2.11 starting")
     log.info(f"Listener ID: {listener_id}")
     log.info(f"Base directory: {BASE_DIR}")
-    log.info(f"Dongles enabled: {len(dongles)} of {len(DONGLES)} configured")
+    log.info(f"Dongles configured: {len(dongles)}")
     for d in dongles:
-        log.info(f"  - {d['serial']}: {d['center_freq_mhz']} MHz, {len(d['channels'])} channels")
+        log.info(
+            f"  - block '{d['block_id']}' serial {d['serial']}: "
+            f"{d['center_freq_mhz']} MHz, {len(d['channels'])} channels"
+        )
         for freq, name, sink in d['channels']:
             log.info(f"      {freq} Hz -> {name} (sink: {sink})")
     log.info(f"Log filename format: {listener_id}_<freq>_<channel>_<YYYYMMDD>.txt")

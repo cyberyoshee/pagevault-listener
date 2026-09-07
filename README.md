@@ -57,12 +57,39 @@ Daily log files -> transferred to central VPS via sftp
 |---|---|
 | `scripts/setup.sh` | Bootstrap listener from fresh Ubuntu install |
 | `scripts/pagevault` | Daemon control (start/stop/restart/status/update) |
-| `scripts/pagevault_daemon_v2_10.py` | Main daemon |
+| `scripts/pagevault_daemon_v2_11.py` | Main daemon |
 | `scripts/push_status.sh` | Push status to central dashboard |
 | `scripts/transfer_logs.sh` | Transfer logs to VPS via sftp |
 | `scripts/status.sh` | Local status viewer |
 | `scripts/update.sh` | Self-updating script puller |
 | `scripts/convert_logs.py` | Convert old captures to daily format |
+| `scripts/frequency_blocks.json` | Frequency block catalogue (edit to add coverage) |
+| `scripts/pagevault_blocks.py` | Block catalogue loader/validator, shared by setup and daemon |
+
+## Frequency blocks
+
+A **block** is one dongle's worth of spectrum: a single center frequency with
+every channel demodulated from that one tuner. Channels are grouped by
+proximity because a dongle only covers so much at once (2.4 MHz reliably).
+
+Setup configures dongles **one at a time** — attach one, pick its block, repeat.
+With several attached at once the enumeration order is arbitrary, so there is no
+way to tell which physical dongle, and therefore which antenna, is which. Each
+dongle gets its block's serial written to its EEPROM, which is how the daemon
+addresses it afterwards. Any number of dongles is supported, and a single-dongle
+listener can pick whichever block it wants.
+
+Blocks are defined in `scripts/frequency_blocks.json`. To add coverage, add a
+block and check it with:
+
+```bash
+python3 scripts/pagevault_blocks.py validate
+```
+
+That enforces the rules the daemon relies on: channels inside the tuner span,
+unique block ids, serials and channel names, and a serial short enough for the
+EEPROM. Assignments are recorded in `config/dongles.conf`; re-run setup to
+change them.
 
 ## Requirements
 
