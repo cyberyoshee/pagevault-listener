@@ -57,7 +57,7 @@ Daily log files -> transferred to central VPS via sftp
 |---|---|
 | `scripts/setup.sh` | Bootstrap listener from fresh Ubuntu install |
 | `scripts/pagevault` | Daemon control (start/stop/restart/status/update) |
-| `scripts/pagevault_daemon_v2_9.py` | Main daemon |
+| `scripts/pagevault_daemon_v2_10.py` | Main daemon |
 | `scripts/push_status.sh` | Push status to central dashboard |
 | `scripts/transfer_logs.sh` | Transfer logs to VPS via sftp |
 | `scripts/status.sh` | Local status viewer |

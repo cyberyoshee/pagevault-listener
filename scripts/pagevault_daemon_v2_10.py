@@ -3,10 +3,25 @@
 PageVault Daemon
 ================
 
-VERSION: 2.9
+VERSION: 2.10
 
 CHANGELOG
 ---------
+v2.10 (2026-09-07)
+  - Disk management. Nothing rotated or pruned before this, and the
+    DISK_PAUSE_THRESHOLD_PCT constant was never referenced, so the disk
+    protection the daemon appeared to have did not exist.
+      * daemon.log and error.log rotate (size-capped, with backups)
+      * push.log and transfer.log are size-capped -- cron appends to those,
+        so no logging handler covers them
+      * archived logs are pruned past a retention window
+      * above the warn threshold, oldest archived logs are deleted until
+        usage drops back under it
+      * above the pause threshold, message logging stops rather than filling
+        the filesystem; dropped messages are counted and reported
+  - Status file reports disk_warn/disk_pause thresholds, archived_files,
+    logs_paused, and messages_dropped
+
 v2.9 (2026-09-07)
   - Dongles are now driven by DONGLE<N>_ENABLED in config/listener.conf
     instead of being unconditionally hardcoded. A single-dongle listener no
@@ -85,6 +100,7 @@ import logging
 import threading
 import subprocess
 import shutil
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timezone
 from queue import Queue, Empty
@@ -97,6 +113,7 @@ BASE_DIR = Path.home() / "pagevault"
 LOGS_DIR = BASE_DIR / "logs"
 LOGS_PROCESSING = LOGS_DIR / "processing"
 LOGS_READY = LOGS_DIR / "ready"
+LOGS_ARCHIVED = LOGS_DIR / "archived"
 STATE_DIR = BASE_DIR / "state"
 CONFIG_DIR = BASE_DIR / "config"
 DAEMON_LOG = STATE_DIR / "daemon.log"
@@ -109,8 +126,30 @@ AIRBAND_AUDIO_RATE = 16000
 MULTIMON_RATE = 22050
 
 # Watchdog
-DISK_PAUSE_THRESHOLD_PCT = 80
 WATCHDOG_CHECK_INTERVAL_SEC = 30
+
+# Disk management
+#
+# Above WARN, the oldest archived logs are deleted until usage drops back
+# under it. Above PAUSE, message logging stops entirely: losing pages is bad,
+# but filling the root filesystem takes down the OS, the decoders and the
+# transfer job all at once, and recovers only by hand.
+DISK_WARN_THRESHOLD_PCT = 80
+DISK_PAUSE_THRESHOLD_PCT = 95
+
+# Archived logs have already been transferred to the VPS and acknowledged;
+# they are kept only as a local safety net.
+ARCHIVED_RETENTION_DAYS = 14
+PRUNE_INTERVAL_SEC = 3600
+
+# The daemon's own logs rotate through logging handlers. push.log and
+# transfer.log are shell appends from cron, so the watchdog caps them instead.
+DAEMON_LOG_MAX_BYTES = 10 * 1024 * 1024
+DAEMON_LOG_BACKUPS = 3
+ERROR_LOG_MAX_BYTES = 2 * 1024 * 1024
+ERROR_LOG_BACKUPS = 2
+CRON_LOG_MAX_BYTES = 2 * 1024 * 1024
+CRON_LOGS = ("push.log", "transfer.log")
 
 # ============================================================
 # DONGLE AND CHANNEL CONFIGURATION
@@ -152,11 +191,34 @@ def setup_logging():
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(threadName)s: %(message)s',
         handlers=[
-            logging.FileHandler(DAEMON_LOG),
+            RotatingFileHandler(
+                DAEMON_LOG,
+                maxBytes=DAEMON_LOG_MAX_BYTES,
+                backupCount=DAEMON_LOG_BACKUPS,
+            ),
             logging.StreamHandler(sys.stdout),
         ]
     )
     return logging.getLogger("pagevault")
+
+def setup_error_logger():
+    """Separate rotating log for decoder failures.
+
+    A crash-looping channel writes here every few seconds, so this has to
+    rotate independently of daemon.log rather than grow without bound.
+    """
+    handler = RotatingFileHandler(
+        ERROR_LOG,
+        maxBytes=ERROR_LOG_MAX_BYTES,
+        backupCount=ERROR_LOG_BACKUPS,
+    )
+    handler.setFormatter(logging.Formatter('%(message)s'))
+
+    err_log = logging.getLogger("pagevault.errors")
+    err_log.setLevel(logging.INFO)
+    err_log.propagate = False
+    err_log.addHandler(handler)
+    return err_log
 
 # ============================================================
 # GLOBAL STATE
@@ -170,8 +232,11 @@ class DaemonState:
         self.stats = {
             "started_at": datetime.now(timezone.utc).isoformat(),
             "messages_decoded": 0,
+            "messages_dropped": 0,
             "channels_active": 0,
         }
+        self.logs_paused = False
+        self.last_prune_at = 0.0
         self.channels = {}
         self.current_utc_date = datetime.now(timezone.utc).strftime("%Y%m%d")
 
@@ -183,33 +248,136 @@ class DaemonState:
                 log.info(f"Midnight UTC reset: date changed from {self.current_utc_date} to {today}")
                 self.current_utc_date = today
                 self.stats["messages_decoded"] = 0
+                self.stats["messages_dropped"] = 0
                 for ch_name in self.channels:
                     self.channels[ch_name]["message_count"] = 0
 
 state = DaemonState()
 log = None
+err_log = None
 
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 
 def ensure_directories():
-    for d in [LOGS_DIR, LOGS_PROCESSING, LOGS_READY, STATE_DIR, CONFIG_DIR]:
+    for d in [LOGS_DIR, LOGS_PROCESSING, LOGS_READY, LOGS_ARCHIVED, STATE_DIR, CONFIG_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 def disk_usage_percent(path):
     stat = shutil.disk_usage(path)
     return (stat.used / stat.total) * 100
 
+def archived_files_sorted():
+    """Archived logs oldest first. Ignores anything that vanishes mid-scan."""
+    entries = []
+    if not LOGS_ARCHIVED.exists():
+        return entries
+    for f in LOGS_ARCHIVED.iterdir():
+        try:
+            if f.is_file():
+                entries.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    entries.sort(key=lambda pair: pair[0])
+    return entries
+
+def prune_archived_by_age():
+    """Delete archived logs past the retention window.
+
+    These have already been transferred and acknowledged by the VPS, so the
+    local copy is only a safety net.
+    """
+    cutoff = time.time() - (ARCHIVED_RETENTION_DAYS * 86400)
+    removed = 0
+    for mtime, f in archived_files_sorted():
+        if mtime >= cutoff:
+            break
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        log.info(f"Pruned {removed} archived log(s) older than {ARCHIVED_RETENTION_DAYS} days")
+    return removed
+
+def free_disk_to(target_pct):
+    """Delete the oldest archived logs until usage drops below target_pct.
+
+    Only touches archived/ -- processing/ and ready/ hold data that has not
+    reached the VPS yet and must never be discarded to reclaim space.
+    """
+    removed = 0
+    for _, f in archived_files_sorted():
+        if disk_usage_percent(BASE_DIR) < target_pct:
+            break
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        log.warning(f"Disk above {target_pct:.0f}%: deleted {removed} oldest archived log(s)")
+    return removed
+
+def trim_cron_logs():
+    """Cap the logs cron appends to.
+
+    push_status.sh and transfer_logs.sh are invoked by cron with `>>`, so no
+    logging handler covers them. Keeps the newest half when over the cap.
+    """
+    for name in CRON_LOGS:
+        path = STATE_DIR / name
+        try:
+            if not path.is_file() or path.stat().st_size <= CRON_LOG_MAX_BYTES:
+                continue
+            with open(path, "rb") as f:
+                f.seek(-(CRON_LOG_MAX_BYTES // 2), os.SEEK_END)
+                f.readline()          # discard the partial line at the seek point
+                tail = f.read()
+            with open(path, "wb") as f:
+                f.write(tail)
+            log.info(f"Trimmed {name} to {len(tail)} bytes")
+        except OSError:
+            pass
+
+def manage_disk():
+    """Reclaim space and decide whether message logging must pause."""
+    now = time.time()
+
+    if now - state.last_prune_at >= PRUNE_INTERVAL_SEC:
+        state.last_prune_at = now
+        prune_archived_by_age()
+        trim_cron_logs()
+
+    usage = disk_usage_percent(BASE_DIR)
+
+    if usage >= DISK_WARN_THRESHOLD_PCT:
+        free_disk_to(DISK_WARN_THRESHOLD_PCT)
+        usage = disk_usage_percent(BASE_DIR)
+
+    paused = usage >= DISK_PAUSE_THRESHOLD_PCT
+    if paused != state.logs_paused:
+        if paused:
+            log.error(
+                f"Disk at {usage:.1f}% (>= {DISK_PAUSE_THRESHOLD_PCT}%): "
+                "pausing message logging until space is freed"
+            )
+        else:
+            log.info(f"Disk back to {usage:.1f}%: resuming message logging")
+    state.logs_paused = paused
+
+    return usage
+
 def timestamp_utc():
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 def write_error_log(channel_name, context, message):
-    """Append an error entry to the error log file."""
+    """Append an error entry to the rotating error log."""
     try:
         stamp = datetime.now(timezone.utc).isoformat()
-        with open(ERROR_LOG, "a") as f:
-            f.write(f"[{stamp}] [{channel_name}] {context}: {message}\n")
+        err_log.info(f"[{stamp}] [{channel_name}] {context}: {message}")
     except Exception:
         pass
 
@@ -526,13 +694,17 @@ def decoder_chain_thread(listener_id, freq_hz, channel_name, sink_name):
 
                 if line.startswith("FLEX") or line.startswith("POCSAG"):
                     if current_message is not None:
-                        log_file = get_log_file(listener_id, freq_hz, channel_name)
-                        with open(log_file, "a") as f:
-                            f.write(current_message + "\n")
-                        with state.lock:
-                            state.stats["messages_decoded"] += 1
-                            state.channels[channel_name]["message_count"] += 1
-                            state.channels[channel_name]["last_message_at"] = datetime.now(timezone.utc).isoformat()
+                        if state.logs_paused:
+                            with state.lock:
+                                state.stats["messages_dropped"] += 1
+                        else:
+                            log_file = get_log_file(listener_id, freq_hz, channel_name)
+                            with open(log_file, "a") as f:
+                                f.write(current_message + "\n")
+                            with state.lock:
+                                state.stats["messages_decoded"] += 1
+                                state.channels[channel_name]["message_count"] += 1
+                                state.channels[channel_name]["last_message_at"] = datetime.now(timezone.utc).isoformat()
                     current_message = line
                 else:
                     if current_message is not None:
@@ -540,7 +712,7 @@ def decoder_chain_thread(listener_id, freq_hz, channel_name, sink_name):
                         if cleaned:
                             current_message += " " + cleaned
 
-            if current_message is not None:
+            if current_message is not None and not state.logs_paused:
                 log_file = get_log_file(listener_id, freq_hz, channel_name)
                 with open(log_file, "a") as f:
                     f.write(current_message + "\n")
@@ -646,7 +818,7 @@ def watchdog_thread():
 
     while state.running:
         try:
-            usage = disk_usage_percent(BASE_DIR)
+            usage = manage_disk()
             now = datetime.now(timezone.utc)
 
             # Check for midnight UTC rollover
@@ -656,8 +828,12 @@ def watchdog_thread():
             with open(status_file, "w") as f:
                 f.write(f"timestamp: {now.isoformat()}\n")
                 f.write(f"disk_usage_pct: {usage:.1f}\n")
+                f.write(f"disk_warn_pct: {DISK_WARN_THRESHOLD_PCT}\n")
+                f.write(f"disk_pause_pct: {DISK_PAUSE_THRESHOLD_PCT}\n")
+                f.write(f"logs_paused: {str(state.logs_paused).lower()}\n")
                 f.write(f"processing_files: {len(list(LOGS_PROCESSING.glob('*.txt')))}\n")
                 f.write(f"ready_files: {len(list(LOGS_READY.glob('*.txt')))}\n")
+                f.write(f"archived_files: {len(archived_files_sorted())}\n")
                 for key, val in state.stats.items():
                     f.write(f"{key}: {val}\n")
 
@@ -725,17 +901,18 @@ def cleanup():
 # ============================================================
 
 def main():
-    global log
+    global log, err_log
 
     ensure_directories()
     log = setup_logging()
+    err_log = setup_error_logger()
 
     config = read_listener_config()
     listener_id = get_listener_id(config)
     dongles = get_enabled_dongles(config)
 
     log.info("=" * 60)
-    log.info("PageVault daemon v2.9 starting")
+    log.info("PageVault daemon v2.10 starting")
     log.info(f"Listener ID: {listener_id}")
     log.info(f"Base directory: {BASE_DIR}")
     log.info(f"Dongles enabled: {len(dongles)} of {len(DONGLES)} configured")
@@ -751,6 +928,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     startup_scan_logs()
+    manage_disk()
 
     threads = []
 
