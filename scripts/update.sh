@@ -9,7 +9,7 @@
 # changes, update it here and push to all listeners.
 # ============================================================
 
-REPO_RAW_URL="https://raw.githubusercontent.com/cyberyoshee/pagevault/main/scripts/setup.sh"
+REPO_RAW_URL="https://raw.githubusercontent.com/cyberyoshee/pagevault-listener/main/scripts/setup.sh"
 
 echo "Fetching latest setup script..."
 TEMP_SETUP=$(mktemp)

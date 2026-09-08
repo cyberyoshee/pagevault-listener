@@ -9,14 +9,14 @@ Captures, decodes, and logs pager traffic from multiple frequencies simultaneous
 On a fresh Ubuntu 26.04 LTS machine with RTL-SDR dongle(s) plugged in:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/cyberyoshee/pagevault/main/scripts/setup.sh | bash
+curl -sL https://raw.githubusercontent.com/cyberyoshee/pagevault-listener/main/scripts/setup.sh | bash
 ```
 
 Or clone and run:
 
 ```bash
-git clone https://github.com/cyberyoshee/pagevault.git
-cd pagevault/scripts
+git clone https://github.com/cyberyoshee/pagevault-listener.git
+cd pagevault-listener/scripts
 ./setup.sh
 ```
 

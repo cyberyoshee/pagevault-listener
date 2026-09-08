@@ -41,7 +41,7 @@ trap 'log_error "Setup failed at line $LINENO. Check output above for details.";
 # CONFIGURATION
 # ============================================================
 
-REPO_URL="https://github.com/cyberyoshee/pagevault.git"
+REPO_URL="https://github.com/cyberyoshee/pagevault-listener.git"
 REPO_BRANCH="main"
 PAGEVAULT_HOME="$HOME/pagevault"
 PAGEVAULT_SCRIPTS="$PAGEVAULT_HOME/scripts"
@@ -100,7 +100,7 @@ require_interactive() {
         echo ""
         log_error "$1 requires an interactive terminal, but none is available."
         log_error "Re-run setup from a terminal:"
-        log_error "  git clone $REPO_URL && ./pagevault/scripts/setup.sh"
+        log_error "  git clone $REPO_URL && ./pagevault-listener/scripts/setup.sh"
         exit 1
     fi
 }
