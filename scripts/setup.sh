@@ -360,6 +360,7 @@ if ! sudo apt install -y -qq \
     pulseaudio-utils \
     usbutils \
     openssh-client \
+    cron \
     > "$APT_LOG" 2>&1
 then
     log_error "Package installation failed:"
@@ -372,7 +373,11 @@ rm -f "$APT_LOG"
 # The daemon shells out to these directly, and step 6 depends on lsusb to
 # detect dongles at all -- fail loudly here rather than leaving decoder
 # chains to crash at runtime or dongle setup to silently see zero devices.
-for bin in pactl parec sox multimon-ng rtl_test rtl_eeprom lsusb ssh-keygen sftp; do
+# crontab specifically: Ubuntu Desktop pulls it in via ubuntu-standard, but
+# that's not guaranteed on every image, and step 11's bare
+# `crontab -l | ... | crontab -` pipeline (not inside a tested condition)
+# would abort the whole run under `set -e` if the command didn't exist.
+for bin in pactl parec sox multimon-ng rtl_test rtl_eeprom lsusb ssh-keygen sftp crontab; do
     if ! command -v "$bin" > /dev/null 2>&1; then
         log_error "Required command '$bin' not found after package install"
         exit 1
@@ -985,7 +990,11 @@ if [ "${REBUILD_AIRBAND:-false}" = true ] || ! command -v rtl_airband &> /dev/nu
     fi
 
     rm -rf build
-    cmake -B build -DPLATFORM=generic -DNFM=ON -DPULSE=ON
+    # PULSEAUDIO is the actual cmake option name as of $AIRBAND_VERSION (it
+    # defaults ON there, which is why an older/wrong flag name here never
+    # visibly broke anything -- but don't rely on that surviving a future
+    # version bump). NFM's name is correct as-is (defaults OFF upstream).
+    cmake -B build -DPLATFORM=generic -DNFM=ON -DPULSEAUDIO=ON
     cmake --build build -j$(nproc)
     sudo cmake --install build
     log_info "RTLSDR-Airband built and installed ($AIRBAND_VERSION)"
