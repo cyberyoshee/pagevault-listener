@@ -1091,15 +1091,35 @@ print(json.dumps({
         elif [ "$STATUS" = "ok" ] && [ -n "$API_KEY" ]; then
             log_info "Registration successful!"
 
+            # Decoded logs land in logs/ready/ regardless of this choice --
+            # transfer is the only thing that leaves the machine. Letting
+            # someone hold that off is a deliberate escape hatch to review a
+            # few files locally before trusting the pipeline to ship them.
+            echo ""
+            echo "  Decoded logs are written locally either way. You can hold"
+            echo "  off on uploading them until you've reviewed a few --"
+            echo "  toggle this anytime later with: pagevault transfer on|off"
+            echo ""
+            prompt ENABLE_TRANSFER "  Enable automatic log file transfer now? (Y/n): "
+            if [ "$ENABLE_TRANSFER" = "n" ] || [ "$ENABLE_TRANSFER" = "N" ]; then
+                TRANSFER_ENABLED_VALUE=false
+            else
+                TRANSFER_ENABLED_VALUE=true
+            fi
+
             # Update listener.conf with server details
             sed -i "s|^CENTRAL_URL=.*|CENTRAL_URL=\"$HEARTBEAT_URL\"|" "$LISTENER_CONF"
             sed -i "s|^CENTRAL_API_KEY=.*|CENTRAL_API_KEY=\"$API_KEY\"|" "$LISTENER_CONF"
             sed -i "s|^REMOTE_USER=.*|REMOTE_USER=\"$SFTP_USER\"|" "$LISTENER_CONF"
             sed -i "s|^REMOTE_HOST=.*|REMOTE_HOST=\"$SFTP_HOST\"|" "$LISTENER_CONF"
             sed -i "s|^REMOTE_DIR=.*|REMOTE_DIR=\"/var/pagevault/logs\"|" "$LISTENER_CONF"
-            sed -i "s|^TRANSFER_ENABLED=.*|TRANSFER_ENABLED=true|" "$LISTENER_CONF"
+            sed -i "s|^TRANSFER_ENABLED=.*|TRANSFER_ENABLED=$TRANSFER_ENABLED_VALUE|" "$LISTENER_CONF"
 
             chmod 600 "$LISTENER_CONF"
+
+            if [ "$TRANSFER_ENABLED_VALUE" = false ]; then
+                log_info "Log transfer left OFF -- review files in logs/ready/, then: pagevault transfer on"
+            fi
 
             log_info "Config updated with API key and server details"
             log_info "Heartbeat URL: $HEARTBEAT_URL"
@@ -1298,6 +1318,7 @@ echo "     pagevault stop      Stop the daemon"
 echo "     pagevault restart   Restart the daemon"
 echo "     pagevault status    Show current status"
 echo "     pagevault update    Pull latest scripts and restart"
+echo "     pagevault transfer [on|off]   Toggle uploading logs to the server"
 
 echo ""
 echo "  Check status:"

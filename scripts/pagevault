@@ -1,9 +1,10 @@
 #!/bin/bash
 # PageVault daemon control
-# Usage: pagevault start|stop|restart|status|update|run
+# Usage: pagevault start|stop|restart|status|update|run|transfer [on|off]
 
 SCRIPTS="$HOME/pagevault/scripts"
 STATE="$HOME/pagevault/state"
+CONFIG="$HOME/pagevault/config/listener.conf"
 UNIT="pagevault.service"
 UNIT_FILE="$HOME/.config/systemd/user/$UNIT"
 
@@ -111,8 +112,63 @@ case "${1:-}" in
             exit 1
         fi
         ;;
+    transfer)
+        # Toggles whether transfer_logs.sh actually uploads anything. The
+        # daemon and decoding are untouched either way -- this only affects
+        # whether logs/ready/ gets swept to the server or just accumulates
+        # locally for review.
+        if [ ! -f "$CONFIG" ]; then
+            echo "No listener config found at $CONFIG -- run setup.sh first"
+            exit 1
+        fi
+
+        case "${2:-}" in
+            on)
+                # shellcheck disable=SC1090
+                source "$CONFIG"
+                if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_USER" ]; then
+                    echo "Warning: REMOTE_USER/REMOTE_HOST are not set yet."
+                    echo "Transfer will stay a no-op until this listener is registered"
+                    echo "(re-run setup.sh, which prompts for a registration token)."
+                fi
+
+                sed -i 's|^TRANSFER_ENABLED=.*|TRANSFER_ENABLED=true|' "$CONFIG"
+                chmod 600 "$CONFIG"
+
+                # The flag alone does nothing if setup never installed the
+                # cron job -- which is exactly what happens when transfer was
+                # left off during registration.
+                if [ -f "$SCRIPTS/transfer_logs.sh" ] \
+                    && ! crontab -l 2>/dev/null | grep -q "transfer_logs.sh"; then
+                    (crontab -l 2>/dev/null; echo "# PageVault -- transfer completed logs daily at 00:05 UTC") | crontab -
+                    (crontab -l 2>/dev/null; echo "5 0 * * * $SCRIPTS/transfer_logs.sh >> $STATE/transfer.log 2>&1") | crontab -
+                    echo "Log file transfer: ON (cron job installed, daily at 00:05 UTC)"
+                else
+                    echo "Log file transfer: ON"
+                fi
+                ;;
+            off)
+                sed -i 's|^TRANSFER_ENABLED=.*|TRANSFER_ENABLED=false|' "$CONFIG"
+                chmod 600 "$CONFIG"
+                echo "Log file transfer: OFF (files still decode locally to logs/ready/)"
+                ;;
+            "")
+                # shellcheck disable=SC1090
+                source "$CONFIG"
+                if [ "${TRANSFER_ENABLED:-false}" = "true" ]; then
+                    echo "Log file transfer: ON"
+                else
+                    echo "Log file transfer: OFF"
+                fi
+                ;;
+            *)
+                echo "Usage: pagevault transfer [on|off]"
+                exit 1
+                ;;
+        esac
+        ;;
     *)
-        echo "Usage: pagevault start|stop|restart|status|update|run"
+        echo "Usage: pagevault start|stop|restart|status|update|run|transfer [on|off]"
         exit 1
         ;;
 esac

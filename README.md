@@ -28,6 +28,8 @@ pagevault stop       Stop the daemon
 pagevault restart    Restart the daemon
 pagevault status     Show current status
 pagevault update     Pull latest scripts from repo
+pagevault transfer [on|off]   Toggle uploading logs to the server
+                              (with no argument, shows the current state)
 ```
 
 ## Architecture
