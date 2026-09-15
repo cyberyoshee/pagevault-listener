@@ -488,14 +488,213 @@ os.close(fd)
     return 1
 }
 
-configure_dongles() {
-    require_interactive "Dongle configuration"
+# Writes $2 to dongle $1's EEPROM (skipped if it already carries that serial,
+# $3), resets the device so the new serial takes effect, and confirms some
+# attached dongle now reports it. Shared by every path that assigns a block.
+write_dongle_serial() {
+    local idx="$1" target_serial="$2" current_serial="$3"
 
+    if [ "$current_serial" = "$target_serial" ]; then
+        log_info "Dongle already carries serial '$target_serial'"
+        return 0
+    fi
+
+    log_info "Writing serial '$target_serial' to dongle $idx"
+    rtl_eeprom -d "$idx" -s "$target_serial" > /dev/null 2>&1 <<< "y" || true
+
+    if usb_reset_dongle "$idx"; then
+        log_info "EEPROM written, USB reset complete"
+    else
+        log_warn "EEPROM written but the USB reset failed"
+        prompt _REPLUG "  Unplug and replug this dongle, then press Enter: "
+    fi
+    sleep 2
+
+    local verified=false vidx vser
+    while IFS="$(printf '\t')" read -r vidx vser; do
+        [ "$vser" = "$target_serial" ] && verified=true
+    done < <(list_dongles)
+
+    if [ "$verified" = true ]; then
+        log_info "Verified: a dongle now reports serial '$target_serial'"
+    else
+        log_warn "Could not verify serial '$target_serial' -- the daemon may not find this dongle"
+    fi
+}
+
+# Waits (up to 10s) for the attached-dongle count to rise above $2, then
+# identifies whichever attached dongle's serial is not in $1 (newline
+# separated). Sets NEW_DONGLE_INDEX/NEW_DONGLE_SERIAL and returns 0, or
+# clears both and returns 1 if nothing new showed up.
+detect_new_dongle() {
+    local known_serials="$1" baseline="$2"
+    local new_count=0 waited=0 idx ser
+    NEW_DONGLE_INDEX=""
+    NEW_DONGLE_SERIAL=""
+
+    new_count=$(dongle_count)
+    while [ "$new_count" -le "$baseline" ] && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+        new_count=$(dongle_count)
+    done
+    [ "$new_count" -gt "$baseline" ] || return 1
+
+    while IFS="$(printf '\t')" read -r idx ser; do
+        [ -n "$idx" ] || continue
+        if ! printf '%s\n' "$known_serials" | grep -qxF "$ser"; then
+            NEW_DONGLE_INDEX="$idx"
+            NEW_DONGLE_SERIAL="$ser"
+            return 0
+        fi
+    done < <(list_dongles)
+    return 1
+}
+
+# Prints the block menu (excluding the comma list $1) and prompts for a
+# choice. Sets CHOSEN_BLOCK_ID, or leaves it empty if nothing is left to offer.
+prompt_block_choice() {
+    local exclude="$1"
+    local remaining bid blabel bdesc bnch bcentre bchans
+    local menu_ids=() n=0 choice=""
+
+    CHOSEN_BLOCK_ID=""
+    remaining=$(python3 "$BLOCKS_PY" list --exclude "$exclude")
+    [ -n "$remaining" ] || return 0
+
+    echo ""
+    echo "  Which frequency block should this dongle listen to?"
+    echo ""
+    while IFS="$(printf '\t')" read -r bid blabel bdesc bnch bcentre bchans; do
+        [ -n "$bid" ] || continue
+        n=$((n + 1))
+        menu_ids+=("$bid")
+        printf "    %d) %s -- %s\n" "$n" "$blabel" "$bdesc"
+        printf "       %s channels centered on %s MHz\n" "$bnch" "$bcentre"
+        printf "       %s\n\n" "$bchans"
+    done <<< "$remaining"
+
+    while [ -z "$choice" ]; do
+        prompt choice "  Select block (1-$n): "
+        if ! echo "$choice" | grep -qE '^[0-9]+$' \
+            || [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
+            echo "  Enter a number between 1 and $n"
+            choice=""
+        fi
+    done
+    CHOSEN_BLOCK_ID="${menu_ids[$((choice - 1))]}"
+}
+
+# ------------------------------------------------------------
+# dongles.conf as in-memory parallel arrays: DC_BLOCK[i]/DC_SERIAL[i].
+# Positions are renumbered 1..N on every save -- nothing else references
+# them, so that's safe and keeps add/change/remove simple.
+# ------------------------------------------------------------
+
+load_dongles_conf() {
+    DC_BLOCK=()
+    DC_SERIAL=()
+    [ -f "$DONGLES_CONF" ] || return 0
+    # shellcheck disable=SC1090
+    source "$DONGLES_CONF"
+    local i bvar svar
+    for i in $(seq 1 "${DONGLE_COUNT:-0}"); do
+        bvar="DONGLE_${i}_BLOCK"
+        svar="DONGLE_${i}_SERIAL"
+        DC_BLOCK+=("${!bvar}")
+        DC_SERIAL+=("${!svar}")
+    done
+}
+
+save_dongles_conf() {
+    mkdir -p "$PAGEVAULT_CONFIG"
+    {
+        echo "# ============================================================"
+        echo "# PageVault Dongle Assignments"
+        echo "# ============================================================"
+        echo "#"
+        echo "# Written by setup.sh -- one dongle per frequency block."
+        echo "# Block definitions live in scripts/frequency_blocks.json."
+        echo "#"
+        echo "# The serials below are written into each dongle's EEPROM, so"
+        echo "# re-run setup.sh to change assignments rather than editing"
+        echo "# this file by hand."
+        echo ""
+        echo "DONGLE_COUNT=${#DC_BLOCK[@]}"
+        local i
+        for i in "${!DC_BLOCK[@]}"; do
+            echo "DONGLE_$((i + 1))_BLOCK=\"${DC_BLOCK[$i]}\""
+            echo "DONGLE_$((i + 1))_SERIAL=\"${DC_SERIAL[$i]}\""
+        done
+    } > "$DONGLES_CONF"
+    log_info "Wrote $DONGLES_CONF (${#DC_BLOCK[@]} dongle(s))"
+}
+
+# Comma list of every currently-assigned block, optionally skipping index $1
+# (0-based) -- used by "change" so an entry doesn't exclude its own block.
+assigned_blocks_csv() {
+    local skip="${1:--1}" out="" i
+    for i in "${!DC_BLOCK[@]}"; do
+        [ "$i" = "$skip" ] && continue
+        out="${out:+$out,}${DC_BLOCK[$i]}"
+    done
+    printf '%s' "$out"
+}
+
+# Newline list of every currently-assigned serial.
+assigned_serials_nl() {
+    local i
+    for i in "${!DC_SERIAL[@]}"; do
+        printf '%s\n' "${DC_SERIAL[$i]}"
+    done
+}
+
+# Attach-one/assign-one/repeat loop, shared by a full reconfigure and an
+# incremental add. Assumes DC_BLOCK[]/DC_SERIAL[] already hold whatever
+# should count as "already assigned" -- empty for a reconfigure, loaded from
+# dongles.conf for an add -- and appends to them as dongles are configured.
+assignment_loop() {
+    local baseline block_serial
+    while true; do
+        if [ -z "$(python3 "$BLOCKS_PY" list --exclude "$(assigned_blocks_csv)")" ]; then
+            echo ""
+            log_info "Every block in the catalogue is now assigned"
+            break
+        fi
+
+        echo ""
+        echo "  ---- Dongle $((${#DC_BLOCK[@]} + 1)) ----"
+        echo "  Attach the next dongle now, then press Enter."
+        echo "  Or press Enter with nothing new attached to finish."
+        baseline=$(dongle_count)
+        prompt _GO "  > "
+
+        if ! detect_new_dongle "$(assigned_serials_nl)" "$baseline"; then
+            echo ""
+            log_info "No new dongle detected -- finishing dongle configuration"
+            break
+        fi
+
+        echo ""
+        log_info "Detected dongle at index $NEW_DONGLE_INDEX (current serial: '$NEW_DONGLE_SERIAL')"
+
+        prompt_block_choice "$(assigned_blocks_csv)"
+        block_serial=$(python3 "$BLOCKS_PY" field "$CHOSEN_BLOCK_ID" serial)
+        write_dongle_serial "$NEW_DONGLE_INDEX" "$block_serial" "$NEW_DONGLE_SERIAL"
+
+        DC_BLOCK+=("$CHOSEN_BLOCK_ID")
+        DC_SERIAL+=("$block_serial")
+        log_info "Dongle ${#DC_BLOCK[@]} configured: block '$CHOSEN_BLOCK_ID'"
+    done
+}
+
+reconfigure_all_dongles() {
+    require_interactive "Dongle configuration"
     sudo rmmod dvb_usb_rtl28xxu 2>/dev/null || true
 
     echo ""
     echo "============================================================"
-    echo "  Dongle Configuration"
+    echo "  Dongle Configuration -- Start Over"
     echo "============================================================"
     echo ""
     echo "  Each dongle is assigned one frequency block, and that block's"
@@ -516,173 +715,180 @@ configure_dongles() {
     done
     log_info "Starting with no dongles attached"
 
-    local assigned_blocks="" assigned_serials="" dongle_lines=""
-    local attached=0 configured=0
-    local remaining menu_ids n choice block_id block_serial
-    local new_count waited new_index new_serial verified
-    local bid blabel bdesc bnch bcentre bchans idx ser
+    DC_BLOCK=()
+    DC_SERIAL=()
+    assignment_loop
 
-    while true; do
-        remaining=$(python3 "$BLOCKS_PY" list --exclude "$assigned_blocks")
-        if [ -z "$remaining" ]; then
-            echo ""
-            log_info "Every block in the catalogue is now assigned"
-            break
-        fi
-
-        echo ""
-        echo "  ---- Dongle $((configured + 1)) ----"
-        echo "  Attach the next dongle now, then press Enter."
-        echo "  Or press Enter with nothing attached to finish."
-        prompt _GO "  > "
-
-        # Give USB a moment to enumerate
-        new_count=$(dongle_count)
-        waited=0
-        while [ "$new_count" -le "$attached" ] && [ "$waited" -lt 10 ]; do
-            sleep 1
-            waited=$((waited + 1))
-            new_count=$(dongle_count)
-        done
-
-        if [ "$new_count" -le "$attached" ]; then
-            echo ""
-            log_info "No new dongle detected -- finishing dongle configuration"
-            break
-        fi
-
-        # The new dongle is the one whose serial we have not just assigned
-        new_index=""
-        new_serial=""
-        while IFS="$(printf '\t')" read -r idx ser; do
-            [ -n "$idx" ] || continue
-            if ! printf '%s\n' "$assigned_serials" | grep -qxF "$ser"; then
-                new_index="$idx"
-                new_serial="$ser"
-                break
-            fi
-        done < <(list_dongles)
-
-        if [ -z "$new_index" ]; then
-            log_warn "Could not identify the newly attached dongle."
-            log_warn "It may already carry a serial assigned earlier in this run."
-            prompt _RETRY "  Unplug it, then press Enter to try again: "
-            continue
-        fi
-
-        echo ""
-        log_info "Detected dongle at index $new_index (current serial: '$new_serial')"
-        echo ""
-        echo "  Which frequency block should this dongle listen to?"
-        echo ""
-
-        menu_ids=()
-        n=0
-        while IFS="$(printf '\t')" read -r bid blabel bdesc bnch bcentre bchans; do
-            [ -n "$bid" ] || continue
-            n=$((n + 1))
-            menu_ids+=("$bid")
-            printf "    %d) %s -- %s\n" "$n" "$blabel" "$bdesc"
-            printf "       %s channels centered on %s MHz\n" "$bnch" "$bcentre"
-            printf "       %s\n\n" "$bchans"
-        done <<< "$remaining"
-
-        choice=""
-        while [ -z "$choice" ]; do
-            prompt choice "  Select block (1-$n): "
-            if ! echo "$choice" | grep -qE '^[0-9]+$' \
-                || [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
-                echo "  Enter a number between 1 and $n"
-                choice=""
-            fi
-        done
-
-        block_id="${menu_ids[$((choice - 1))]}"
-        block_serial=$(python3 "$BLOCKS_PY" field "$block_id" serial)
-
-        if [ "$new_serial" = "$block_serial" ]; then
-            log_info "Dongle already carries serial '$block_serial'"
-        else
-            log_info "Writing serial '$block_serial' to dongle $new_index"
-            rtl_eeprom -d "$new_index" -s "$block_serial" > /dev/null 2>&1 <<< "y" || true
-
-            if usb_reset_dongle "$new_index"; then
-                log_info "EEPROM written, USB reset complete"
-            else
-                log_warn "EEPROM written but the USB reset failed"
-                prompt _REPLUG "  Unplug and replug this dongle, then press Enter: "
-            fi
-            sleep 2
-        fi
-
-        verified=false
-        while IFS="$(printf '\t')" read -r idx ser; do
-            [ "$ser" = "$block_serial" ] && verified=true
-        done < <(list_dongles)
-
-        if [ "$verified" = true ]; then
-            log_info "Verified: a dongle now reports serial '$block_serial'"
-        else
-            log_warn "Could not verify serial '$block_serial' -- the daemon may not find this dongle"
-        fi
-
-        configured=$((configured + 1))
-        attached=$(dongle_count)
-        assigned_blocks="${assigned_blocks:+$assigned_blocks,}$block_id"
-        assigned_serials="${assigned_serials}${block_serial}
-"
-        dongle_lines="${dongle_lines}DONGLE_${configured}_BLOCK=\"$block_id\"
-DONGLE_${configured}_SERIAL=\"$block_serial\"
-"
-        log_info "Dongle $configured configured: block '$block_id'"
-    done
-
-    if [ "$configured" -eq 0 ]; then
+    if [ "${#DC_BLOCK[@]}" -eq 0 ]; then
         log_warn "No dongles configured -- the daemon will not start until at least one is"
     fi
-
-    mkdir -p "$PAGEVAULT_CONFIG"
-    {
-        echo "# ============================================================"
-        echo "# PageVault Dongle Assignments"
-        echo "# ============================================================"
-        echo "#"
-        echo "# Written by setup.sh -- one dongle per frequency block."
-        echo "# Block definitions live in scripts/frequency_blocks.json."
-        echo "#"
-        echo "# The serials below are written into each dongle's EEPROM, so"
-        echo "# re-run setup.sh to change assignments rather than editing"
-        echo "# this file by hand."
-        echo ""
-        echo "DONGLE_COUNT=$configured"
-        printf '%s' "$dongle_lines"
-    } > "$DONGLES_CONF"
-
-    log_info "Wrote $DONGLES_CONF ($configured dongle(s))"
+    save_dongles_conf
 }
 
-RECONFIGURE_DONGLES=true
+add_dongles() {
+    require_interactive "Dongle configuration"
+    load_dongles_conf
+
+    if [ -z "$(python3 "$BLOCKS_PY" list --exclude "$(assigned_blocks_csv)")" ]; then
+        log_warn "Every block in the catalogue is already assigned to a dongle."
+        log_warn "Add a new block to frequency_blocks.json first."
+        return 0
+    fi
+
+    sudo rmmod dvb_usb_rtl28xxu 2>/dev/null || true
+
+    echo ""
+    echo "============================================================"
+    echo "  Add Dongle(s)"
+    echo "============================================================"
+    echo ""
+    echo "  Already-configured dongles can stay attached -- only the new"
+    echo "  one needs to go in one at a time."
+    echo ""
+
+    assignment_loop
+    save_dongles_conf
+}
+
+change_dongle_block() {
+    require_interactive "Dongle configuration"
+    load_dongles_conf
+
+    if [ "${#DC_BLOCK[@]}" -eq 0 ]; then
+        log_warn "No dongles configured yet"
+        return 0
+    fi
+
+    echo ""
+    echo "  Which dongle do you want to change?"
+    echo ""
+    local i choice sel current_serial found_idx idx ser block_serial
+    for i in "${!DC_BLOCK[@]}"; do
+        printf "    %d) block '%s' (serial %s)\n" "$((i + 1))" "${DC_BLOCK[$i]}" "${DC_SERIAL[$i]}"
+    done
+
+    choice=""
+    while [ -z "$choice" ]; do
+        prompt choice "  Select dongle (1-${#DC_BLOCK[@]}): "
+        if ! echo "$choice" | grep -qE '^[0-9]+$' \
+            || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#DC_BLOCK[@]}" ]; then
+            echo "  Enter a number between 1 and ${#DC_BLOCK[@]}"
+            choice=""
+        fi
+    done
+    sel=$((choice - 1))
+    current_serial="${DC_SERIAL[$sel]}"
+
+    # This one is looked up by its known serial, not by "what's new", so it
+    # has to actually be attached right now.
+    found_idx=""
+    while IFS="$(printf '\t')" read -r idx ser; do
+        [ "$ser" = "$current_serial" ] && found_idx="$idx"
+    done < <(list_dongles)
+
+    if [ -z "$found_idx" ]; then
+        log_error "No attached dongle currently reports serial '$current_serial'."
+        log_error "Plug in the dongle for block '${DC_BLOCK[$sel]}' and try again."
+        return 1
+    fi
+
+    prompt_block_choice "$(assigned_blocks_csv "$sel")"
+    if [ -z "$CHOSEN_BLOCK_ID" ]; then
+        log_warn "No other block available to switch to"
+        return 0
+    fi
+
+    block_serial=$(python3 "$BLOCKS_PY" field "$CHOSEN_BLOCK_ID" serial)
+    write_dongle_serial "$found_idx" "$block_serial" "$current_serial"
+
+    DC_BLOCK[$sel]="$CHOSEN_BLOCK_ID"
+    DC_SERIAL[$sel]="$block_serial"
+    save_dongles_conf
+    log_info "Dongle updated: now block '$CHOSEN_BLOCK_ID'"
+}
+
+remove_dongle() {
+    require_interactive "Dongle configuration"
+    load_dongles_conf
+
+    if [ "${#DC_BLOCK[@]}" -eq 0 ]; then
+        log_warn "No dongles configured yet"
+        return 0
+    fi
+
+    echo ""
+    echo "  Which dongle do you want to remove from the configuration?"
+    echo ""
+    local i choice sel
+    for i in "${!DC_BLOCK[@]}"; do
+        printf "    %d) block '%s' (serial %s)\n" "$((i + 1))" "${DC_BLOCK[$i]}" "${DC_SERIAL[$i]}"
+    done
+
+    choice=""
+    while [ -z "$choice" ]; do
+        prompt choice "  Select dongle (1-${#DC_BLOCK[@]}): "
+        if ! echo "$choice" | grep -qE '^[0-9]+$' \
+            || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#DC_BLOCK[@]}" ]; then
+            echo "  Enter a number between 1 and ${#DC_BLOCK[@]}"
+            choice=""
+        fi
+    done
+    sel=$((choice - 1))
+
+    log_info "Removing block '${DC_BLOCK[$sel]}' (serial ${DC_SERIAL[$sel]}) from the configuration"
+    log_info "The dongle's EEPROM serial is left as-is -- it's free to be reassigned later"
+
+    unset 'DC_BLOCK[sel]'
+    unset 'DC_SERIAL[sel]'
+    DC_BLOCK=("${DC_BLOCK[@]}")
+    DC_SERIAL=("${DC_SERIAL[@]}")
+    save_dongles_conf
+}
 
 if [ -f "$DONGLES_CONF" ]; then
-    # shellcheck disable=SC1090
-    source "$DONGLES_CONF"
+    load_dongles_conf
     echo ""
-    log_info "Existing dongle configuration (${DONGLE_COUNT:-0} dongle(s)):"
-    for i in $(seq 1 "${DONGLE_COUNT:-0}"); do
-        _bvar="DONGLE_${i}_BLOCK"
-        _svar="DONGLE_${i}_SERIAL"
-        log_info "  $i. block '${!_bvar}' (serial ${!_svar})"
+    log_info "Existing dongle configuration (${#DC_BLOCK[@]} dongle(s)):"
+    for _i in "${!DC_BLOCK[@]}"; do
+        log_info "  $((_i + 1)). block '${DC_BLOCK[$_i]}' (serial ${DC_SERIAL[$_i]})"
     done
-    echo ""
-    prompt RECONF "  Reconfigure dongles? (y/n): "
-    if [ "$RECONF" != "y" ] && [ "$RECONF" != "Y" ]; then
-        RECONFIGURE_DONGLES=false
-        log_info "Keeping existing dongle configuration"
-    fi
-fi
 
-if [ "$RECONFIGURE_DONGLES" = true ]; then
-    configure_dongles
+    if [ "$INTERACTIVE" != true ]; then
+        echo ""
+        log_info "Non-interactive run -- keeping existing dongle configuration"
+    else
+        echo ""
+        echo "  What would you like to do?"
+        echo "    1) Keep this configuration"
+        echo "    2) Add a new dongle"
+        echo "    3) Change a dongle's frequency block"
+        echo "    4) Remove a dongle"
+        echo "    5) Start over (reconfigure everything from scratch)"
+        echo ""
+
+        DONGLE_MENU_CHOICE=""
+        while [ -z "$DONGLE_MENU_CHOICE" ]; do
+            prompt DONGLE_MENU_CHOICE "  Select an option (1-5): "
+            case "$DONGLE_MENU_CHOICE" in
+                1|2|3|4|5) ;;
+                *) echo "  Enter a number between 1 and 5"; DONGLE_MENU_CHOICE="" ;;
+            esac
+        done
+
+        case "$DONGLE_MENU_CHOICE" in
+            1) log_info "Keeping existing dongle configuration" ;;
+            2) add_dongles ;;
+            # change_dongle_block returns non-zero for a recoverable problem
+            # (its target dongle isn't attached) -- under `set -e`, calling it
+            # bare here would abort the whole setup run rather than just this
+            # one menu action, so guard it explicitly.
+            3) change_dongle_block || true ;;
+            4) remove_dongle ;;
+            5) reconfigure_all_dongles ;;
+        esac
+    fi
+else
+    reconfigure_all_dongles
 fi
 
 # ----------------------------------------------------------
