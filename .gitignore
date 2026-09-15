@@ -2,6 +2,7 @@
 logs/
 state/
 config/
+build/
 iq/
 
 # Build artifacts

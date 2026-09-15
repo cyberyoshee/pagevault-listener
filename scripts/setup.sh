@@ -52,6 +52,9 @@ PAGEVAULT_CONFIG="$PAGEVAULT_HOME/config"
 PAGEVAULT_STATE="$PAGEVAULT_HOME/state"
 AIRBAND_BUILD_DIR="$PAGEVAULT_HOME/build/RTLSDR-Airband"
 AIRBAND_BUILD_DIR_LEGACY="$HOME/RTLSDR-Airband"
+# Pinned so an upstream regression can't silently change listener behavior on
+# the next build. Bump deliberately -- check release notes first.
+AIRBAND_VERSION="v5.3.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -132,6 +135,14 @@ install_scripts() {
     done
 }
 
+# Escapes a string for safe use as the replacement side of `sed s|old|new|`.
+# Backslash, the delimiter, and & (which sed expands to the whole match) all
+# need escaping there -- an API key or hostname containing any of them would
+# otherwise corrupt listener.conf instead of being written verbatim.
+sed_escape_replacement() {
+    printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'
+}
+
 check_ubuntu() {
     if ! grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
         log_error "This script is designed for Ubuntu."
@@ -202,6 +213,45 @@ check_audio_session() {
 # PARSE ARGUMENTS
 # ============================================================
 
+# Kept in sync with the header comment by hand -- can't just read it off $0,
+# since under `curl | bash` $0 is "bash", not this script's own source.
+print_help() {
+    cat << 'HELPEOF'
+PageVault Listener Setup Script
+================================
+
+Sets up a complete PageVault listener on a fresh Ubuntu 26.04 LTS
+install. Idempotent -- safe to run multiple times.
+
+What it does:
+  1. Installs system dependencies (apt packages)
+  2. Verifies a PulseAudio/PipeWire session is actually reachable
+  3. Blacklists DVB kernel driver for RTL-SDR access
+  4. Configures USB permissions for non-root SDR access
+  5. Creates directory structure
+  6. Pulls latest PageVault scripts from the repository
+  7. Assigns a frequency block to each dongle, one dongle at a time
+  8. Builds and installs RTLSDR-Airband with NFM + PulseAudio
+  9. Creates listener config (interactive prompts)
+ 10. Self-registers with central server (registration token)
+ 11. Sets up cron jobs (status push, log transfer)
+ 12. Optionally starts daemon and installs a systemd user unit
+
+Usage:
+  ./setup.sh                     # Full setup
+  ./setup.sh --update            # Pull latest scripts only
+  ./setup.sh --help              # Show this help
+
+Prerequisites:
+  - Ubuntu 26.04 LTS (desktop with PipeWire/PulseAudio)
+  - Internet access, sudo privileges, and a terminal (setup is interactive)
+  - Registration token from the PageVault admin
+  - Safe to run via `curl ... | bash`: prompts read from /dev/tty, not stdin
+  - The GitHub repo must be temporarily PUBLIC for setup to clone scripts;
+    setup aborts immediately if it cannot reach it anonymously
+HELPEOF
+}
+
 UPDATE_ONLY=false
 
 case "${1:-}" in
@@ -209,7 +259,7 @@ case "${1:-}" in
         UPDATE_ONLY=true
         ;;
     --help|-h)
-        head -40 "$0" | grep "^#" | sed 's/^# *//'
+        print_help
         exit 0
         ;;
 esac
@@ -377,7 +427,7 @@ EOF"
     log_info "USB permissions configured"
 fi
 
-if groups "$USER" | grep -q "plugdev"; then
+if groups "$USER" | grep -qw "plugdev"; then
     log_info "User already in plugdev group"
 else
     sudo usermod -aG plugdev "$USER"
@@ -921,9 +971,16 @@ if [ "${REBUILD_AIRBAND:-false}" = true ] || ! command -v rtl_airband &> /dev/nu
 
     if [ -d "$AIRBAND_BUILD_DIR" ]; then
         cd "$AIRBAND_BUILD_DIR"
-        git pull origin master 2>/dev/null || true
+        git fetch --tags origin 2>/dev/null || true
+        if ! git checkout "$AIRBAND_VERSION" 2>/dev/null; then
+            log_warn "Could not check out $AIRBAND_VERSION -- building whatever is on disk instead"
+        fi
     else
-        git clone https://github.com/szpajder/RTLSDR-Airband.git "$AIRBAND_BUILD_DIR"
+        if ! git clone --branch "$AIRBAND_VERSION" --depth 1 \
+            https://github.com/szpajder/RTLSDR-Airband.git "$AIRBAND_BUILD_DIR"; then
+            log_error "Could not clone RTLSDR-Airband at $AIRBAND_VERSION"
+            exit 1
+        fi
         cd "$AIRBAND_BUILD_DIR"
     fi
 
@@ -931,7 +988,7 @@ if [ "${REBUILD_AIRBAND:-false}" = true ] || ! command -v rtl_airband &> /dev/nu
     cmake -B build -DPLATFORM=generic -DNFM=ON -DPULSE=ON
     cmake --build build -j$(nproc)
     sudo cmake --install build
-    log_info "RTLSDR-Airband built and installed"
+    log_info "RTLSDR-Airband built and installed ($AIRBAND_VERSION)"
 fi
 
 if ! ldd "$(which rtl_airband)" | grep -q "libpulse"; then
@@ -1107,11 +1164,13 @@ print(json.dumps({
                 TRANSFER_ENABLED_VALUE=true
             fi
 
-            # Update listener.conf with server details
-            sed -i "s|^CENTRAL_URL=.*|CENTRAL_URL=\"$HEARTBEAT_URL\"|" "$LISTENER_CONF"
-            sed -i "s|^CENTRAL_API_KEY=.*|CENTRAL_API_KEY=\"$API_KEY\"|" "$LISTENER_CONF"
-            sed -i "s|^REMOTE_USER=.*|REMOTE_USER=\"$SFTP_USER\"|" "$LISTENER_CONF"
-            sed -i "s|^REMOTE_HOST=.*|REMOTE_HOST=\"$SFTP_HOST\"|" "$LISTENER_CONF"
+            # Update listener.conf with server details. Values come from the
+            # registration response, not something we control, so escape them
+            # before they hit the replacement side of a sed s|||.
+            sed -i "s|^CENTRAL_URL=.*|CENTRAL_URL=\"$(sed_escape_replacement "$HEARTBEAT_URL")\"|" "$LISTENER_CONF"
+            sed -i "s|^CENTRAL_API_KEY=.*|CENTRAL_API_KEY=\"$(sed_escape_replacement "$API_KEY")\"|" "$LISTENER_CONF"
+            sed -i "s|^REMOTE_USER=.*|REMOTE_USER=\"$(sed_escape_replacement "$SFTP_USER")\"|" "$LISTENER_CONF"
+            sed -i "s|^REMOTE_HOST=.*|REMOTE_HOST=\"$(sed_escape_replacement "$SFTP_HOST")\"|" "$LISTENER_CONF"
             sed -i "s|^REMOTE_DIR=.*|REMOTE_DIR=\"/var/pagevault/logs\"|" "$LISTENER_CONF"
             sed -i "s|^TRANSFER_ENABLED=.*|TRANSFER_ENABLED=$TRANSFER_ENABLED_VALUE|" "$LISTENER_CONF"
 
@@ -1131,6 +1190,19 @@ print(json.dumps({
                     log_info "VPS host key added to known_hosts"
                 else
                     log_warn "Could not fetch host key for $SFTP_HOST -- first sftp run may fail"
+                fi
+
+                # Verify the upload path actually works now, rather than
+                # leaving that discovery for the first cron-driven transfer
+                # (up to 24h away) or someone running `pagevault transfer on`.
+                log_info "Testing SFTP connectivity to $SFTP_USER@$SFTP_HOST..."
+                if echo "pwd" | timeout 20 sftp -q -o BatchMode=yes -o ConnectTimeout=10 \
+                    -i "$SSH_KEY" -b - "${SFTP_USER}@${SFTP_HOST}" > /dev/null 2>&1; then
+                    log_info "SFTP connectivity OK"
+                else
+                    log_warn "Could not connect via SFTP as $SFTP_USER@$SFTP_HOST"
+                    log_warn "Log transfer will fail until this is fixed -- check network/firewall"
+                    log_warn "and that the VPS admin added this listener's key correctly"
                 fi
             fi
 
@@ -1341,7 +1413,7 @@ if [ -f "$HOME/.config/systemd/user/pagevault.service" ]; then
     echo ""
 fi
 
-if ! groups "$USER" | grep -q "plugdev"; then
+if ! groups "$USER" | grep -qw "plugdev"; then
     echo -e "  ${YELLOW}IMPORTANT: Log out and back in for USB permissions${NC}"
     echo ""
 fi
