@@ -8,16 +8,17 @@
 #
 # What it does:
 #   1. Installs system dependencies (apt packages)
-#   2. Blacklists DVB kernel driver for RTL-SDR access
-#   3. Configures USB permissions for non-root SDR access
-#   4. Creates directory structure
-#   5. Pulls latest PageVault scripts from the repository
-#   6. Assigns a frequency block to each dongle, one dongle at a time
-#   7. Builds and installs RTLSDR-Airband with NFM + PulseAudio
-#   8. Creates listener config (interactive prompts)
-#   9. Self-registers with central server (registration token)
-#  10. Sets up cron jobs (status push, log transfer)
-#  11. Optionally starts daemon and installs a systemd user unit
+#   2. Verifies a PulseAudio/PipeWire session is actually reachable
+#   3. Blacklists DVB kernel driver for RTL-SDR access
+#   4. Configures USB permissions for non-root SDR access
+#   5. Creates directory structure
+#   6. Pulls latest PageVault scripts from the repository
+#   7. Assigns a frequency block to each dongle, one dongle at a time
+#   8. Builds and installs RTLSDR-Airband with NFM + PulseAudio
+#   9. Creates listener config (interactive prompts)
+#  10. Self-registers with central server (registration token)
+#  11. Sets up cron jobs (status push, log transfer)
+#  12. Optionally starts daemon and installs a systemd user unit
 #
 # Usage:
 #   ./setup.sh                     # Full setup
@@ -29,6 +30,8 @@
 #   - Internet access, sudo privileges, and a terminal (setup is interactive)
 #   - Registration token from the PageVault admin
 #   - Safe to run via `curl ... | bash`: prompts read from /dev/tty, not stdin
+#   - The GitHub repo must be temporarily PUBLIC for setup to clone scripts;
+#     setup aborts immediately if it cannot reach it anonymously
 #
 # ============================================================
 
@@ -137,6 +140,64 @@ check_ubuntu() {
     log_info "Detected: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
 }
 
+# Every code path that reaches scripts (this check, step 6's pull, and
+# --update) does it by git-cloning REPO_URL anonymously. Against a private
+# repo that clone doesn't just fail -- git tries a credential prompt first,
+# which either hangs or garbles a `curl | bash` run. Check reachability up
+# front, with prompting and hangs both disabled, so a private repo is one
+# clear error instead of a confusing failure deep inside setup.
+check_repo_public() {
+    # git itself may not be preinstalled -- this runs before step 1's package
+    # list, deliberately, so a private repo is caught before any real work.
+    # Sudo access is already verified by the time this is called.
+    if ! command -v git > /dev/null 2>&1; then
+        log_info "Installing git (needed to check the repository)"
+        sudo apt update -qq && sudo apt install -y -qq git \
+            || { log_error "Could not install git"; exit 1; }
+    fi
+
+    log_info "Checking that the repository is public: $REPO_URL"
+    if ! GIT_TERMINAL_PROMPT=0 timeout 15 git ls-remote "$REPO_URL" HEAD > /dev/null 2>&1; then
+        log_error "Cannot reach $REPO_URL anonymously."
+        log_error "Make the repository PUBLIC on GitHub for the duration of setup"
+        log_error "(switch it back to private once setup finishes), then re-run setup."
+        exit 1
+    fi
+    log_info "Repository is public and reachable"
+}
+
+# The whole decode pipeline runs through `pactl`/`parec` against whatever
+# implements the PulseAudio protocol -- pipewire-pulse on a stock Ubuntu
+# desktop, or classic pulseaudio. Without it, setup can still finish "green"
+# while the daemon spins forever creating no sinks and decoding nothing. Check
+# for a live session now, with a bounded timeout so a wedged server can't hang
+# setup, and give a specific reason rather than just "pactl info failed".
+check_audio_session() {
+    local pulse_log
+    if pulse_log=$(timeout 10 pactl info 2>&1); then
+        log_info "Audio session OK: $(echo "$pulse_log" | grep '^Server Name' | cut -d: -f2- | sed 's/^ *//')"
+        return 0
+    fi
+
+    log_error "Cannot reach a PulseAudio/PipeWire session ('pactl info' failed):"
+    echo "$pulse_log" | sed 's/^/    /'
+    echo ""
+
+    if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+        log_error "XDG_RUNTIME_DIR is not set -- this shell has no active login session."
+        log_error "Log into the desktop (directly, or over SSH once someone has logged"
+        log_error "into the desktop at least once), then re-run setup."
+    elif ! pgrep -x pipewire-pulse > /dev/null 2>&1 && ! pgrep -x pulseaudio > /dev/null 2>&1; then
+        log_error "Neither pipewire-pulse nor pulseaudio is running for this user."
+        log_error "Log into the graphical desktop session, then re-run setup."
+    else
+        log_error "A pulse server process is running but not answering. Check:"
+        log_error "  systemctl --user status pipewire-pulse.service pulseaudio.service"
+    fi
+
+    exit 1
+}
+
 # ============================================================
 # PARSE ARGUMENTS
 # ============================================================
@@ -148,7 +209,7 @@ case "${1:-}" in
         UPDATE_ONLY=true
         ;;
     --help|-h)
-        head -35 "$0" | grep "^#" | sed 's/^# *//'
+        head -40 "$0" | grep "^#" | sed 's/^# *//'
         exit 0
         ;;
 esac
@@ -171,6 +232,8 @@ if ! sudo -n true 2>/dev/null; then
     sudo true || { log_error "Cannot obtain sudo access"; exit 1; }
 fi
 
+check_repo_public
+
 # ----------------------------------------------------------
 # UPDATE MODE
 # ----------------------------------------------------------
@@ -185,6 +248,7 @@ if [ "$UPDATE_ONLY" = true ]; then
 
     # Stage inside PAGEVAULT_HOME so install_scripts can use a plain rename
     mkdir -p "$PAGEVAULT_HOME"
+    chmod 700 "$PAGEVAULT_HOME"
     TEMP_REPO="$PAGEVAULT_HOME/.update-$$"
     trap 'rm -rf "$TEMP_REPO"' EXIT
 
@@ -219,7 +283,7 @@ fi
 # STEP 1: Install system dependencies
 # ----------------------------------------------------------
 
-log_info "Step 1/11: Installing system dependencies"
+log_info "Step 1/12: Installing system dependencies"
 
 sudo apt update -qq
 
@@ -244,6 +308,8 @@ if ! sudo apt install -y -qq \
     librtlsdr-dev \
     libpulse-dev \
     pulseaudio-utils \
+    usbutils \
+    openssh-client \
     > "$APT_LOG" 2>&1
 then
     log_error "Package installation failed:"
@@ -253,9 +319,10 @@ then
 fi
 rm -f "$APT_LOG"
 
-# The daemon shells out to these directly -- fail loudly here rather than
-# leaving every decoder chain to crash at runtime.
-for bin in pactl parec sox multimon-ng rtl_test; do
+# The daemon shells out to these directly, and step 6 depends on lsusb to
+# detect dongles at all -- fail loudly here rather than leaving decoder
+# chains to crash at runtime or dongle setup to silently see zero devices.
+for bin in pactl parec sox multimon-ng rtl_test rtl_eeprom lsusb ssh-keygen sftp; do
     if ! command -v "$bin" > /dev/null 2>&1; then
         log_error "Required command '$bin' not found after package install"
         exit 1
@@ -265,10 +332,18 @@ done
 log_info "System dependencies installed"
 
 # ----------------------------------------------------------
-# STEP 2: Blacklist DVB kernel driver
+# STEP 2: Verify PulseAudio/PipeWire audio session
 # ----------------------------------------------------------
 
-log_info "Step 2/11: Configuring kernel driver blacklist"
+log_info "Step 2/12: Verifying PulseAudio/PipeWire audio session"
+
+check_audio_session
+
+# ----------------------------------------------------------
+# STEP 3: Blacklist DVB kernel driver
+# ----------------------------------------------------------
+
+log_info "Step 3/12: Configuring kernel driver blacklist"
 
 BLACKLIST_FILE="/etc/modprobe.d/blacklist-rtl.conf"
 if [ -f "$BLACKLIST_FILE" ]; then
@@ -285,10 +360,10 @@ EOF"
 fi
 
 # ----------------------------------------------------------
-# STEP 3: USB permissions
+# STEP 4: USB permissions
 # ----------------------------------------------------------
 
-log_info "Step 3/11: Configuring USB permissions"
+log_info "Step 4/12: Configuring USB permissions"
 
 UDEV_FILE="/etc/udev/rules.d/20-rtlsdr.rules"
 if [ -f "$UDEV_FILE" ]; then
@@ -310,10 +385,10 @@ else
 fi
 
 # ----------------------------------------------------------
-# STEP 4: Create directory structure
+# STEP 5: Create directory structure
 # ----------------------------------------------------------
 
-log_info "Step 4/11: Creating directory structure"
+log_info "Step 5/12: Creating directory structure"
 
 mkdir -p "$PAGEVAULT_HOME/scripts"
 mkdir -p "$PAGEVAULT_HOME/logs/processing"
@@ -322,13 +397,22 @@ mkdir -p "$PAGEVAULT_HOME/logs/archived"
 mkdir -p "$PAGEVAULT_HOME/state"
 mkdir -p "$PAGEVAULT_HOME/config"
 
-log_info "Directory structure created at $PAGEVAULT_HOME"
+# logs/ holds decoded pager traffic and config/ holds listener.conf's API key
+# and dongles.conf -- none of that should be readable by other accounts on
+# the box. mkdir's default mode plus Ubuntu's stock umask (002) leaves
+# directories world-readable, so lock the whole tree down explicitly at the
+# root rather than trust every subdirectory to inherit something tighter.
+# Root (sudo steps) and the daemon's own systemd/cron jobs (which run as this
+# same user, not root) are unaffected -- both already own or bypass this.
+chmod 700 "$PAGEVAULT_HOME"
+
+log_info "Directory structure created at $PAGEVAULT_HOME (mode 700 -- owner-only)"
 
 # ----------------------------------------------------------
-# STEP 5: Pull latest scripts from repository
+# STEP 6: Pull latest scripts from repository
 # ----------------------------------------------------------
 
-log_info "Step 5/11: Pulling latest scripts"
+log_info "Step 6/12: Pulling latest scripts"
 
 TEMP_REPO="$PAGEVAULT_HOME/.update-$$"
 trap 'rm -rf "$TEMP_REPO"' EXIT
@@ -358,10 +442,10 @@ if [ -f "$PAGEVAULT_SCRIPTS/pagevault" ]; then
 fi
 
 # ----------------------------------------------------------
-# STEP 6: Dongle configuration
+# STEP 7: Dongle configuration
 # ----------------------------------------------------------
 
-log_info "Step 6/11: Dongle configuration"
+log_info "Step 7/12: Dongle configuration"
 
 BLOCKS_PY="$PAGEVAULT_SCRIPTS/pagevault_blocks.py"
 DONGLES_CONF="$PAGEVAULT_CONFIG/dongles.conf"
@@ -602,10 +686,10 @@ if [ "$RECONFIGURE_DONGLES" = true ]; then
 fi
 
 # ----------------------------------------------------------
-# STEP 7: Build and install RTLSDR-Airband
+# STEP 8: Build and install RTLSDR-Airband
 # ----------------------------------------------------------
 
-log_info "Step 7/11: Building RTLSDR-Airband"
+log_info "Step 8/12: Building RTLSDR-Airband"
 
 if command -v rtl_airband &> /dev/null; then
     if ldd "$(which rtl_airband)" | grep -q "libpulse"; then
@@ -651,10 +735,10 @@ fi
 log_info "RTLSDR-Airband verified: NFM + PulseAudio enabled"
 
 # ----------------------------------------------------------
-# STEP 8: Create listener config if not exists
+# STEP 9: Create listener config if not exists
 # ----------------------------------------------------------
 
-log_info "Step 8/11: Checking listener configuration"
+log_info "Step 9/12: Checking listener configuration"
 
 LISTENER_CONF="$PAGEVAULT_CONFIG/listener.conf"
 
@@ -722,10 +806,10 @@ CONFEOF
 fi
 
 # ----------------------------------------------------------
-# STEP 9: Self-registration with central server
+# STEP 10: Self-registration with central server
 # ----------------------------------------------------------
 
-log_info "Step 9/11: Server registration"
+log_info "Step 10/12: Server registration"
 
 source "$LISTENER_CONF"
 
@@ -836,10 +920,10 @@ print(json.dumps({
 fi
 
 # ----------------------------------------------------------
-# STEP 10: Set up cron jobs
+# STEP 11: Set up cron jobs
 # ----------------------------------------------------------
 
-log_info "Step 10/11: Configuring cron jobs"
+log_info "Step 11/12: Configuring cron jobs"
 
 source "$LISTENER_CONF" 2>/dev/null || true
 
@@ -893,10 +977,10 @@ if [ "$CRON_CHANGED" = true ]; then
 fi
 
 # ----------------------------------------------------------
-# STEP 11: Start the daemon
+# STEP 12: Start the daemon
 # ----------------------------------------------------------
 
-log_info "Step 11/11: Daemon startup"
+log_info "Step 12/12: Daemon startup"
 
 # Resolve the daemon the same way the control script does -- newest by
 # version -- so shipping a new daemon never needs a constant bumped here.
