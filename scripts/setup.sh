@@ -168,13 +168,42 @@ check_repo_public() {
     fi
 
     log_info "Checking that the repository is public: $REPO_URL"
-    if ! GIT_TERMINAL_PROMPT=0 timeout 15 git ls-remote "$REPO_URL" HEAD > /dev/null 2>&1; then
-        log_error "Cannot reach $REPO_URL anonymously."
-        log_error "Make the repository PUBLIC on GitHub for the duration of setup"
-        log_error "(switch it back to private once setup finishes), then re-run setup."
-        exit 1
+    local git_err
+    git_err=$(GIT_TERMINAL_PROMPT=0 timeout 15 git ls-remote "$REPO_URL" HEAD 2>&1 >/dev/null)
+    local rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_info "Repository is public and reachable"
+        return 0
     fi
-    log_info "Repository is public and reachable"
+
+    # A private repo is only one of several things that can make an
+    # anonymous `git ls-remote` fail, and they all previously produced the
+    # same misleading "make it public" message. Distinguish them so the
+    # real problem (usually DNS/network/TLS on this machine, not GitHub's
+    # visibility setting) is what actually gets reported.
+    log_error "Cannot reach $REPO_URL anonymously."
+    if [ "$rc" -eq 124 ]; then
+        log_error "The check timed out after 15s -- this looks like a network"
+        log_error "reachability problem on this machine (no internet, DNS not"
+        log_error "resolving, or a firewall/proxy blocking github.com), not a"
+        log_error "repository visibility issue."
+    elif echo "$git_err" | grep -qi "could not resolve host"; then
+        log_error "DNS lookup for github.com failed on this machine. Check"
+        log_error "/etc/resolv.conf and that this machine has working DNS/internet."
+    elif echo "$git_err" | grep -qiE "certificate|ssl"; then
+        log_error "TLS/certificate error talking to github.com -- check this"
+        log_error "machine's system clock and CA certificate store"
+        log_error "(sudo apt install --reinstall ca-certificates)."
+    elif echo "$git_err" | grep -qiE "not found|403|authentication"; then
+        log_error "GitHub rejected the anonymous request -- this one genuinely"
+        log_error "looks like a visibility/permissions issue. Make the"
+        log_error "repository PUBLIC on GitHub for the duration of setup"
+        log_error "(switch it back to private once setup finishes), then re-run setup."
+    else
+        log_error "Unrecognized failure -- raw git error below, not a guess:"
+    fi
+    log_error "git said: ${git_err:-<no output>}"
+    exit 1
 }
 
 # The whole decode pipeline runs through `pactl`/`parec` against whatever
