@@ -869,7 +869,8 @@ def watchdog_thread():
             state.check_midnight_reset()
 
             status_file = STATE_DIR / "status.txt"
-            with open(status_file, "w") as f:
+            tmp_status_file = STATE_DIR / "status.txt.tmp"
+            with open(tmp_status_file, "w") as f:
                 f.write(f"timestamp: {now.isoformat()}\n")
                 f.write(f"disk_usage_pct: {usage:.1f}\n")
                 f.write(f"disk_warn_pct: {DISK_WARN_THRESHOLD_PCT}\n")
@@ -906,6 +907,14 @@ def watchdog_thread():
                         pid_str = "/".join(str(p) for p in pids.values()) if pids else "none"
                         last_at_str = last_msg if last_msg else "never"
                         f.write(f"{ch_name}: status={status} msgs={count} last={ago_str} last_at={last_at_str} freq_hz={freq_hz} restarts={restarts} pids={pid_str}\n")
+
+            # Atomic swap: rename() is atomic on the same filesystem, so a
+            # concurrent reader (push_status.sh, via cron) always sees either
+            # the complete old file or the complete new one, never a partial
+            # write torn mid-line (which previously showed up as corrupted
+            # channel names, e.g. a dropped leading character, when the cron
+            # read and this write happened to land close together).
+            os.replace(tmp_status_file, status_file)
 
         except Exception as e:
             log.exception(f"Watchdog exception: {e}")
