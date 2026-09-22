@@ -543,6 +543,15 @@ os.close(fd)
     return 1
 }
 
+# True (0) if some attached dongle currently reports serial $1.
+verify_dongle_serial() {
+    local target="$1" vidx vser
+    while IFS="$(printf '\t')" read -r vidx vser; do
+        [ "$vser" = "$target" ] && return 0
+    done < <(list_dongles)
+    return 1
+}
+
 # Writes $2 to dongle $1's EEPROM (skipped if it already carries that serial,
 # $3), resets the device so the new serial takes effect, and confirms some
 # attached dongle now reports it. Shared by every path that assigns a block.
@@ -558,19 +567,29 @@ write_dongle_serial() {
     rtl_eeprom -d "$idx" -s "$target_serial" > /dev/null 2>&1 <<< "y" || true
 
     if usb_reset_dongle "$idx"; then
-        log_info "EEPROM written, USB reset complete"
+        log_info "EEPROM written, USB reset issued"
     else
-        log_warn "EEPROM written but the USB reset failed"
-        prompt _REPLUG "  Unplug and replug this dongle, then press Enter: "
+        log_warn "EEPROM written but the USB reset call itself failed"
     fi
     sleep 2
 
-    local verified=false vidx vser
-    while IFS="$(printf '\t')" read -r vidx vser; do
-        [ "$vser" = "$target_serial" ] && verified=true
-    done < <(list_dongles)
+    if verify_dongle_serial "$target_serial"; then
+        log_info "Verified: a dongle now reports serial '$target_serial'"
+        return 0
+    fi
 
-    if [ "$verified" = true ]; then
+    # A soft USB reset resets the communication layer, but on most
+    # RTL2832U-based dongles it does NOT reliably force the chip to reload
+    # its EEPROM into the enumerated serial-number descriptor -- that
+    # usually needs a real power cycle. So a failed verification here falls
+    # back to a physical replug, regardless of whether the reset call
+    # itself reported success above (it can "succeed" as an ioctl while
+    # doing nothing useful on this hardware).
+    log_warn "Soft USB reset didn't take effect -- a physical replug is needed"
+    prompt _REPLUG "  Unplug and replug this dongle, then press Enter: "
+    sleep 2
+
+    if verify_dongle_serial "$target_serial"; then
         log_info "Verified: a dongle now reports serial '$target_serial'"
     else
         log_warn "Could not verify serial '$target_serial' -- the daemon may not find this dongle"
